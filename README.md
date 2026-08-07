@@ -331,9 +331,12 @@ needing one each. `--timeout` bounds the wait and exits 1 if it passes.
 
 Two details that make it hold up:
 
-- The requester reads the reply subject's **current end before publishing
-  the request**, so a reply that arrives before it starts polling is not
-  missed.
+- The requester **subscribes before it publishes**. It registers a
+  throwaway push subscription on the reply subject, then sends the
+  request, so a reply that comes back instantly still has somewhere to
+  land — and then it waits on a socket rather than asking every hundred
+  milliseconds. The subscription and its receipt go when the process
+  does, so a request leaves nothing behind.
 - Responders share a **queue group**, so each request is handled once no
   matter how many are running, and the reply is published with an
   idempotency key derived from the correlation — a redelivered request
@@ -762,10 +765,9 @@ What a reader sees after a trim depends on which kind of cursor it holds:
   expose its readiness fd for libcurl's sockets to be waited on alongside.
   It costs nothing when idle and nothing measurable in flight, but a
   `http11c_pollfd()` upstream would remove it.
-- **`bjmsg reply` and `bjmsg pipe` still poll.** Both drive `GET /sub` or
-  `POST /take` on an interval. They are the same shape as `sub` and
-  `work` with a publish on the end, so the receiver machinery covers
-  them; they are simply not converted yet.
+- **Nothing polls, and `--interval` is accepted only to be ignored.** It
+  is left in so existing scripts still run; it prints a note and does
+  nothing.
 - **A queue group's in-flight table is capped** at 256 jobs. Past that a
   `take` returns nothing until acks come in, which is backpressure rather
   than an error — but it does bound how many jobs one group can have

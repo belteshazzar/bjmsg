@@ -23,7 +23,6 @@
 #include <time.h>
 
 #define DEFAULT_URL "http://127.0.0.1:8080"
-#define DEFAULT_POLL_MS 200
 #define DEFAULT_RETRY_MS 5000
 
 /* Ctrl-C: stop whatever loop is running, promptly. Installed by
@@ -31,7 +30,8 @@
 static volatile sig_atomic_t g_stop;
 static void on_interrupt(int sig) { (void)sig; g_stop = 1; }
 
-/* Interrupted by a signal, which is how Ctrl-C escapes a retry wait. */
+/* Interrupted by a signal, which is how Ctrl-C escapes a retry wait. It
+ * is the only thing left in this file that sleeps. */
 static void sleep_ms(long ms) {
     struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
     nanosleep(&ts, NULL);
@@ -1123,7 +1123,7 @@ typedef struct {
     int         have_lease, have_attempts;
     int         have_backoff, have_max_backoff, have_delay;
     int         max;
-    long        retry_ms, interval_ms;
+    long        retry_ms;
     int         force, clear, del, ignore_consumers;
     const char *text;      /* second positional, for request */
     uint64_t    timeout_ms;
@@ -1244,8 +1244,11 @@ static int query_parse(int argc, char **argv, query_opts *o, const char *usage) 
             o->max_attempts = strtoull(v, NULL, 10);
             o->have_attempts = 1;
         } else if (strcmp(a, "--interval") == 0) {
-            const char *v = arg_value(argc, argv, &i, "--interval");
-            if (!v || parse_ms(v, &o->interval_ms) != 0) return 2;
+            /* Accepted so existing scripts still run, and ignored:
+             * nothing polls any more, so there is no interval to set. */
+            if (!arg_value(argc, argv, &i, "--interval")) return 2;
+            fprintf(stderr, "bjmsg: --interval no longer does anything — "
+                            "messages are pushed, not polled\n");
         } else if (strcmp(a, "--bind") == 0) {
             if (!(o->bind_addr = arg_value(argc, argv, &i, "--bind"))) return 2;
         } else if (strcmp(a, "--callback") == 0) {
@@ -1695,6 +1698,10 @@ static int run_job(worker *w, const char *subject, const job *j) {
         return 0;
     }
     if (j->feed.len) fwrite(j->feed.p, 1, j->feed.len, child);
+    /* Terminate the line, as `sub --exec` does: the payload is rendered
+     * text, and a handler built around `read` gets nothing useful from a
+     * stream that never ends a line. */
+    fputc('\n', child);
     int st = pclose(child);
     return st != -1 && WIFEXITED(st) && WEXITSTATUS(st) == 0;
 }
@@ -2063,19 +2070,6 @@ static void rr_binary(void *ctx, const uint8_t *b, uint32_t len) {
     m->have = 1;
 }
 
-/* The subject's highest index, or 0. Used to start tailing replies from
- * the end BEFORE the request goes out, so a fast reply is not missed. */
-static uint64_t subject_last_index(client *c, const query_opts *o,
-                                   const char *subject) {
-    char url[1024];
-    snprintf(url, sizeof url, "%s/sub/%s?from=%llu",
-             o->url_base, subject, (unsigned long long)UINT64_MAX);
-    curl_easy_setopt(c->curl, CURLOPT_CUSTOMREQUEST, NULL);
-    curl_easy_setopt(c->curl, CURLOPT_HTTPGET, 1L);
-    c->last_index = 0;
-    long status = client_perform(c, url);
-    return status == 200 ? c->last_index : 0;
-}
 
 #define REQUEST_USAGE \
     "usage: bjmsg request [--url URL] <subject> <text> [--timeout D]\n" \
@@ -2087,6 +2081,59 @@ static uint64_t subject_last_index(client *c, const query_opts *o,
     "\n" \
     "  --timeout D    how long to wait (default 5s); exits 1 on timeout\n" \
     "  --reply-to S   reply subject (default " REPLY_SUBJECT_DEFAULT ")\n"
+
+/*
+ * The requester receives its reply too. It registers a throwaway push
+ * subscription on the reply subject before publishing, waits for the
+ * delivery that carries its correlation, and unregisters on the way out
+ * — so waiting costs one blocked poll on a socket rather than a request
+ * every hundred milliseconds.
+ *
+ * The correlation still does the matching, because a reply subject is
+ * shared: several requesters may be waiting on it and each delivery may
+ * carry replies for any of them.
+ */
+typedef struct {
+    char        path[64];
+    char        token[BJM_TOKEN_MAX + 1];
+    const char *want;      /* our correlation */
+    int         matched;
+} requester;
+
+static void h_awaited(http11c_request *req, http11c_response *res) {
+    requester *rq = http11c_req_ctx(req);
+
+    if (rq->token[0]) {
+        const char *auth = http11c_req_header(req, "Authorization");
+        char want[BJM_TOKEN_MAX + 16];
+        snprintf(want, sizeof want, "Bearer %s", rq->token);
+        if (!auth || strcmp(auth, want) != 0) {
+            http11c_res_header(res, "Content-Type", "text/plain");
+            http11c_res_text(res, 401, "bad or missing bearer token\n");
+            return;
+        }
+    }
+
+    size_t len = 0;
+    const uint8_t *body = (const uint8_t *)http11c_req_body(req, &len);
+    if (body && len) {
+        corr_scan sc;
+        memset(&sc, 0, sizeof sc);
+        sc.want = rq->want;
+        bj_visitor v = bjm_visitor_noop(&sc);
+        v.on_key = cs_key;
+        v.on_int = cs_int;
+        v.on_binary = cs_binary;
+        v.on_object_end = cs_object_end;
+        if (bj_decode(body, len, &v, NULL) == BJ_OK && sc.matched)
+            rq->matched = 1;
+    }
+
+    /* Accept the batch either way: replies for other requesters are not
+     * ours to hold up, and this subscription is about to disappear. */
+    http11c_res_header(res, "Content-Type", "text/plain");
+    http11c_res_text(res, 200, "");
+}
 
 int bjm_cmd_request(int argc, char **argv) {
     query_opts o;
@@ -2100,19 +2147,73 @@ int bjm_cmd_request(int argc, char **argv) {
         return 2;
     }
     uint64_t timeout_ms = o.timeout_ms ? o.timeout_ms : 5000;
-    long idle = o.interval_ms > 0 ? o.interval_ms : 100;
 
     char corr[64];
     make_auto_id(corr, sizeof corr);
 
+    const char *consumer = NULL, *token = NULL;
+    char generated[BJM_CONSUMER_MAX + 1], auto_token[65];
+    if (receiver_identity(&consumer, generated, sizeof generated, "req",
+                          &token, auto_token, sizeof auto_token) != 0) {
+        fprintf(stderr, "bjmsg: cannot read /dev/urandom\n");
+        return 1;
+    }
+
     client c;
     if (client_init(&c, o.retry_ms) != 0) return 1;
 
-    /* Where the reply subject ends now, before the request exists. */
-    uint64_t from = subject_last_index(&c, &o, reply_to) + 1;
+    requester rq;
+    memset(&rq, 0, sizeof rq);
+    snprintf(rq.path, sizeof rq.path, "/reply");
+    snprintf(rq.token, sizeof rq.token, "%s", token);
+    rq.want = corr;
+
+    /*
+     * Listen and register BEFORE publishing. A reply can arrive the
+     * instant the request lands, and a subscription registered after
+     * that would have to be told to replay — which on a shared reply
+     * subject means wading through everybody else's.
+     */
+    char local_ip[64] = "127.0.0.1";
+    if (probe_local_ip(&c, o.url_base, local_ip, sizeof local_ip) != 0) {
+        fprintf(stderr, "bjmsg: cannot reach the broker at %s\n", o.url_base);
+        client_free(&c);
+        return 1;
+    }
+
+    http11c_server *srv = http11c_server_new();
+    if (!srv) { client_free(&c); return 1; }
+    http11c_set_ctx(srv, &rq);
+    http11c_set_max_body(srv, 8u * 1024 * 1024);
+    http11c_route(srv, "POST", rq.path, h_awaited);
+    if (http11c_listen(srv, o.bind_addr ? o.bind_addr : local_ip,
+                       o.port) != 0) {
+        fprintf(stderr, "bjmsg: cannot listen for the reply\n");
+        http11c_server_free(srv);
+        client_free(&c);
+        return 1;
+    }
+
+    char self[BJM_CALLBACK_MAX + 1];
+    if (o.callback) {
+        snprintf(self, sizeof self, "%s", o.callback);
+    } else {
+        char host[80];
+        host_for_url(local_ip, host, sizeof host);
+        snprintf(self, sizeof self, "http://%s:%d%s", host,
+                 http11c_port(srv), rq.path);
+    }
+
+    rc = 1;
+    /* start=last: only replies published from here on can be ours. */
+    if (push_register_at(&c, o.url_base, reply_to, consumer, NULL, self,
+                         token, 0, 0, 1, 0) != 200) {
+        fprintf(stderr, "bjmsg: could not subscribe to %s\n", reply_to);
+        goto done;
+    }
 
     bj_builder *b = bj_builder_new();
-    if (!b) { client_free(&c); return 1; }
+    if (!b) goto done;
     bj_begin_array(b);
     bj_begin_object(b);
     bj_put_key(b, (const uint8_t *)"reply_to", 8);
@@ -2130,62 +2231,150 @@ int bjm_cmd_request(int argc, char **argv) {
              o.url_base, o.subject, corr);
     c.headers = curl_slist_append(NULL, "Content-Type: " BJMSG_MEDIA_TYPE);
     curl_easy_setopt(c.curl, CURLOPT_HTTPHEADER, c.headers);
+    curl_easy_setopt(c.curl, CURLOPT_HTTPGET, 0L);
+    curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, NULL);
     curl_easy_setopt(c.curl, CURLOPT_POST, 1L);
     curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, data);
     curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, (long)len);
 
-    rc = 1;
     if (client_perform(&c, url) != 200) {
         fprintf(stderr, "bjmsg: request could not be published\n");
+        bj_builder_free(b);
         goto done;
     }
+    bj_builder_free(b);
 
-    for (uint64_t waited = 0; waited < timeout_ms && !g_stop;
-         waited += (uint64_t)idle) {
-        snprintf(url, sizeof url, "%s/sub/%s?from=%llu",
-                 o.url_base, reply_to, (unsigned long long)from);
-        curl_easy_setopt(c.curl, CURLOPT_HTTPGET, 1L);
-        curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, NULL);
-
-        long status = client_perform(&c, url);
-        if (status == 404) { sleep_ms(idle); continue; }
-        if (status != 200) { report_error(&c, status); goto done; }
-
-        /* Every message in the batch: on a shared reply subject most of
-         * them belong to other requesters. */
-        corr_scan sc;
-        memset(&sc, 0, sizeof sc);
-        sc.want = corr;
-        bj_visitor v = bjm_visitor_noop(&sc);
-        v.on_key = cs_key;
-        v.on_int = cs_int;
-        v.on_binary = cs_binary;
-        v.on_object_end = cs_object_end;
-        if (bj_decode(c.body.p, c.body.len, &v, NULL) != BJ_OK) {
-            fprintf(stderr, "bjmsg: malformed reply batch\n");
-            goto done;
-        }
-        if (sc.highest >= from) from = sc.highest + 1;
-        if (sc.matched) { rc = 0; goto done; }
-        sleep_ms(idle);
+    /* Blocked on a socket until the reply arrives — no interval, no
+     * requests, and the timeout is the only clock involved. */
+    for (uint64_t waited = 0; waited < timeout_ms && !rq.matched && !g_stop;
+         waited += 50) {
+        if (http11c_poll(srv, 50) < 0) break;
     }
-    if (rc) fprintf(stderr, "bjmsg: no reply within %llums\n",
-                    (unsigned long long)timeout_ms);
+    if (rq.matched) rc = 0;
+    else if (!g_stop)
+        fprintf(stderr, "bjmsg: no reply within %llums\n",
+                (unsigned long long)timeout_ms);
 
 done:
-    bj_builder_free(b);
+    /* Throwaway: take the receipt with it, or a request would leave a
+     * subscription pinning the reply subject against retention. */
+    g_stop = 0;
+    c.retry_ms = 0;
+    c.waiting = 0;
+    push_unregister(&c, o.url_base, consumer, 1);
+    http11c_server_free(srv);
     client_free(&c);
     return rc;
 }
 
 #define REPLY_USAGE \
     "usage: bjmsg reply [--url URL] <subject> --exec CMD [--group G]\n" \
-    "                   [--interval MS]\n" \
+    "                   [--port P] [--callback URL] [--token T]\n" \
     "\n" \
     "Serve requests on <subject>: run CMD for each, publish its stdout to\n" \
-    "the request's reply_to with the same correlation. Repliers share a\n" \
-    "queue group (default " REPLY_GROUP_DEFAULT "), so each request is\n" \
-    "handled once however many are running.\n"
+    "the request's reply_to with the same correlation. Requests are pushed\n" \
+    "here as they arrive, so an idle service makes no requests at all.\n" \
+    "\n" \
+    "Repliers share a queue group (default " REPLY_GROUP_DEFAULT "), so each\n" \
+    "request is handled once however many are running.\n"
+
+/*
+ * A replier is a pushed worker whose handler happens to publish. Nothing
+ * about the request-reply shape needed changing: the reply still goes to
+ * the reply_to subject with the same correlation, and the request is
+ * still a queue-group job so that N repliers answer it once between them.
+ */
+typedef struct {
+    char        path[64];
+    char        token[BJM_TOKEN_MAX + 1];
+    query_opts  o;
+    const char *group;
+    client      pub;         /* a second handle, for publishing replies */
+    buf         out;
+    int         ok;
+} replier;
+
+static void h_reply(http11c_request *req, http11c_response *res) {
+    replier *w = http11c_req_ctx(req);
+
+    if (w->token[0]) {
+        const char *auth = http11c_req_header(req, "Authorization");
+        char want[BJM_TOKEN_MAX + 16];
+        snprintf(want, sizeof want, "Bearer %s", w->token);
+        if (!auth || strcmp(auth, want) != 0) {
+            http11c_res_header(res, "Content-Type", "text/plain");
+            http11c_res_text(res, 401, "bad or missing bearer token\n");
+            return;
+        }
+    }
+
+    size_t len = 0;
+    const uint8_t *body = (const uint8_t *)http11c_req_body(req, &len);
+    if (!body || len == 0) {
+        http11c_res_header(res, "Content-Type", "text/plain");
+        http11c_res_text(res, 400, "empty delivery\n");
+        return;
+    }
+
+    rr_msg m;
+    memset(&m, 0, sizeof m);
+    bj_visitor v = bjm_visitor_noop(&m);
+    v.on_key = rr_key;
+    v.on_int = rr_int;
+    v.on_binary = rr_binary;
+    if (bj_decode(body, len, &v, NULL) != BJ_OK || !m.have) {
+        free(m.payload);
+        http11c_res_header(res, "Content-Type", "text/plain");
+        http11c_res_text(res, 400, "malformed delivery\n");
+        return;
+    }
+
+    const uint8_t *h = NULL, *msg = m.payload;
+    size_t hlen = 0, mlen = m.plen;
+    char reply_to[BJM_SUBJECT_MAX + 1] = "", corr[64] = "";
+    if (m.type == BJM_ENTRY_ENVELOPE)
+        bjm_envelope_split(m.payload, m.plen, &h, &hlen, &msg, &mlen);
+    if (h) {
+        header_value(h, hlen, "reply_to", reply_to, sizeof reply_to);
+        header_value(h, hlen, "correlation", corr, sizeof corr);
+    }
+
+    buf feed = {0};
+    feed_for(msg, mlen, 0, &feed);
+    int st = run_filter(w->o.exec, feed.p, feed.len, &w->out);
+    buf_free(&feed);
+
+    int ok = (st == 0), replied = 0;
+    if (ok && reply_to[0] && corr[0]) {
+        size_t n = w->out.len;
+        while (n > 0 && (w->out.p[n - 1] == '\n' || w->out.p[n - 1] == '\r')) n--;
+        bj_builder *rb = bj_builder_new();
+        if (rb) {
+            bj_put_string(rb, w->out.p, (uint32_t)n);
+            size_t rlen = 0;
+            const uint8_t *rdata = bj_builder_data(rb, &rlen);
+            if (rdata && publish_reply(&w->pub, &w->o, reply_to, corr,
+                                       rdata, rlen) != 200) {
+                fprintf(stderr, "bjmsg: could not publish the reply\n");
+                ok = 0;
+            } else if (rdata) {
+                replied = 1;
+            }
+            bj_builder_free(rb);
+        }
+    }
+
+    /* A request with no reply_to is legitimate — fire and forget — but
+     * saying "replied" when nothing was sent would hide the header
+     * extraction silently failing. */
+    printf("%lld\t%s\n", m.index,
+           !ok ? "failed" : replied ? "replied" : "done (no reply_to)");
+    fflush(stdout);
+    free(m.payload);
+
+    http11c_res_header(res, "Content-Type", "text/plain");
+    http11c_res_text(res, ok ? 200 : 500, ok ? "" : "handler failed\n");
+}
 
 int bjm_cmd_reply(int argc, char **argv) {
     query_opts o;
@@ -2197,94 +2386,47 @@ int bjm_cmd_reply(int argc, char **argv) {
         fputs(REPLY_USAGE, stderr);
         return 2;
     }
-    long idle = o.interval_ms > 0 ? o.interval_ms : DEFAULT_POLL_MS;
 
-    client c;
-    if (client_init(&c, o.retry_ms) != 0) return 1;
-    buf out = {0};
-
-    rc = 0;
-    while (!g_stop) {
-        char url[1024];
-        snprintf(url, sizeof url, "%s/take/%s?group=%s&max=1",
-                 o.url_base, o.subject, group);
-        curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, "POST");
-        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, "");
-        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, 0L);
-
-        long status = client_perform(&c, url);
-        if (g_stop) break;
-        if (status < 0) { rc = 1; break; }
-        if (status == 404) { sleep_ms(idle); continue; }
-        if (status != 200) { report_error(&c, status); rc = 1; break; }
-
-        rr_msg m;
-        memset(&m, 0, sizeof m);
-        bj_visitor v = bjm_visitor_noop(&m);
-        v.on_key = rr_key;
-        v.on_int = rr_int;
-        v.on_binary = rr_binary;
-        if (bj_decode(c.body.p, c.body.len, &v, NULL) != BJ_OK) {
-            fprintf(stderr, "bjmsg: malformed take response\n");
-            rc = 1;
-            break;
-        }
-        if (!m.have) { free(m.payload); sleep_ms(idle); continue; }
-
-        const uint8_t *h = NULL, *msg = m.payload;
-        size_t hlen = 0, mlen = m.plen;
-        char reply_to[BJM_SUBJECT_MAX + 1] = "", corr[64] = "";
-        if (m.type == BJM_ENTRY_ENVELOPE)
-            bjm_envelope_split(m.payload, m.plen, &h, &hlen, &msg, &mlen);
-        if (h) {
-            header_value(h, hlen, "reply_to", reply_to, sizeof reply_to);
-            header_value(h, hlen, "correlation", corr, sizeof corr);
-        }
-
-        buf feed = {0};
-        feed_for(msg, mlen, 0, &feed);
-        int st = run_filter(o.exec, feed.p, feed.len, &out);
-        buf_free(&feed);
-
-        int ok = (st == 0);
-        int replied = 0;
-        if (ok && reply_to[0] && corr[0]) {
-            size_t n = out.len;
-            while (n > 0 && (out.p[n - 1] == '\n' || out.p[n - 1] == '\r')) n--;
-            bj_builder *rb = bj_builder_new();
-            if (rb) {
-                bj_put_string(rb, out.p, (uint32_t)n);
-                size_t rlen = 0;
-                const uint8_t *rdata = bj_builder_data(rb, &rlen);
-                if (rdata &&
-                    publish_reply(&c, &o, reply_to, corr, rdata, rlen) != 200) {
-                    fprintf(stderr, "bjmsg: could not publish the reply\n");
-                    ok = 0;
-                } else if (rdata) {
-                    replied = 1;
-                }
-                bj_builder_free(rb);
-            }
-        }
-
-        snprintf(url, sizeof url, "%s/%s/%s?group=%s&index=%lld",
-                 o.url_base, ok ? "done" : "fail", o.subject, group, m.index);
-        curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, "POST");
-        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, "");
-        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, 0L);
-        client_perform(&c, url);
-
-        /* A request with no reply_to is legitimate — fire and forget —
-         * but saying "replied" when nothing was sent would hide the
-         * header extraction silently failing. */
-        printf("%lld\t%s\n", m.index,
-               !ok ? "failed" : replied ? "replied" : "done (no reply_to)");
-        fflush(stdout);
-        free(m.payload);
+    const char *consumer = o.consumer, *token = o.token;
+    char generated[BJM_CONSUMER_MAX + 1], auto_token[65];
+    if (receiver_identity(&consumer, generated, sizeof generated, "reply",
+                          &token, auto_token, sizeof auto_token) != 0) {
+        fprintf(stderr, "bjmsg: cannot read /dev/urandom\n");
+        return 1;
     }
 
-    buf_free(&out);
-    client_free(&c);
+    replier w;
+    memset(&w, 0, sizeof w);
+    snprintf(w.path, sizeof w.path, "/request");
+    snprintf(w.token, sizeof w.token, "%s", token);
+    w.o = o;
+    w.group = group;
+    /*
+     * Publishing from inside the delivery handler needs its own handle:
+     * the receiver's is busy with the registration and the heartbeat, and
+     * a reply must not have to wait for either.
+     */
+    if (client_init(&w.pub, o.retry_ms) != 0) return 1;
+
+    receiver_spec sp;
+    memset(&sp, 0, sizeof sp);
+    sp.url_base = o.url_base;
+    sp.pattern = o.subject;
+    sp.consumer = consumer;
+    sp.group = group;
+    sp.bind_addr = o.bind_addr;
+    sp.callback = o.callback;
+    sp.token = token;
+    sp.path = w.path;
+    sp.retry_ms = o.retry_ms;
+    sp.heartbeat_ms = DEFAULT_HEARTBEAT_MS;
+    sp.port = o.port;
+    sp.handler = h_reply;
+    sp.ctx = &w;
+    rc = receiver_run(&sp);
+
+    buf_free(&w.out);
+    client_free(&w.pub);
     return rc;
 }
 
@@ -2382,42 +2524,10 @@ static void feed_for(const uint8_t *payload, size_t plen, int raw, buf *out) {
     free(text);
 }
 
-/* One input message: its index and its payload bytes, copied because the
- * response buffer is reused by the next request. */
-typedef struct {
-    char      key[16];
-    long long index;
-    uint8_t  *payload;
-    size_t    plen;
-    int       have;
-} pipe_msg;
-
-static void pm_key(void *ctx, const uint8_t *k, uint32_t len) {
-    pipe_msg *m = ctx;
-    if (len >= sizeof m->key) len = sizeof m->key - 1;
-    memcpy(m->key, k, len);
-    m->key[len] = '\0';
-}
-
-static void pm_int(void *ctx, double v) {
-    pipe_msg *m = ctx;
-    if (!m->have && strcmp(m->key, "index") == 0) m->index = (long long)v;
-}
-
-static void pm_binary(void *ctx, const uint8_t *b, uint32_t len) {
-    pipe_msg *m = ctx;
-    if (m->have || strcmp(m->key, "payload") != 0) return;
-    m->payload = malloc(len ? len : 1);
-    if (!m->payload) return;
-    memcpy(m->payload, b, len);
-    m->plen = len;
-    m->have = 1;
-}
-
 #define PIPE_USAGE \
     "usage: bjmsg pipe [--url URL] <in-subject> --consumer NAME\n" \
-    "                  --to <out-subject> --exec CMD [--raw] [--follow]\n" \
-    "                  [--interval MS]\n" \
+    "                  --to <out-subject> --exec CMD [--raw]\n" \
+    "                  [--port P] [--callback URL] [--token T]\n" \
     "\n" \
     "Read a subject, transform each message with CMD, publish the result\n" \
     "to another subject. The publish and the input's acknowledgement\n" \
@@ -2431,7 +2541,181 @@ static void pm_binary(void *ctx, const uint8_t *b, uint32_t len) {
     "               leaves it unacknowledged to be retried\n" \
     "  --raw        stdin and stdout are encoded binjson rather than the\n" \
     "               rendered text form\n" \
-    "  --follow     keep polling once the input is drained\n"
+    "  --port P     port to receive on (default: any free one)\n"
+
+/*
+ * A pipeline stage is a pushed subscription whose handler publishes. The
+ * effectively-once guarantee is unchanged and still lives in the ORDER of
+ * two writes: the output is published with the input's acknowledgement
+ * riding along in the same broker call, so a crash before it replays the
+ * input, and the rerun's output collapses onto the one already there by
+ * its idempotency key.
+ */
+typedef struct {
+    char        path[64];
+    char        token[BJM_TOKEN_MAX + 1];
+    query_opts  o;
+    client      pub;
+    bj_builder *bld;
+    buf         outbuf;
+    /* Per delivery: how far this batch got, and whether to stop. */
+    char        key[16];
+    long long   index;
+    uint64_t    took;
+    int         stopped;
+} piper;
+
+/* Publish one transformed message, acknowledging the input with it.
+ * Returns 1 when the input may be considered handled. */
+static int pipe_one(piper *pp, const uint8_t *payload, size_t plen) {
+    query_opts *o = &pp->o;
+
+    buf feed = {0};
+    feed_for(payload, plen, o->raw, &feed);
+
+    char env[32];
+    setenv("BJMSG_SUBJECT", o->subject, 1);
+    setenv("BJMSG_CONSUMER", o->consumer, 1);
+    snprintf(env, sizeof env, "%lld", pp->index);
+    setenv("BJMSG_INDEX", env, 1);
+
+    int st = run_filter(o->exec, feed.p, feed.len, &pp->outbuf);
+    buf_free(&feed);
+
+    if (st != 0) {
+        fprintf(stderr, "bjmsg: %lld failed (exit %d), not acknowledged\n",
+                pp->index, st);
+        return 0;
+    }
+
+    if (pp->outbuf.len == 0) {
+        /* The handler dropped it. Nothing to publish, and nothing more to
+         * do — the delivery's own acknowledgement carries the input past
+         * it, so the stage still makes progress. */
+        printf("%lld\tdropped\n", pp->index);
+        fflush(stdout);
+        return 1;
+    }
+
+    const uint8_t *body = pp->outbuf.p;
+    size_t body_len = pp->outbuf.len;
+    if (!o->raw) {
+        /* Text out becomes a binjson STRING, trailing newline and all
+         * removed — a shell filter almost always adds one. */
+        size_t n = pp->outbuf.len;
+        while (n > 0 &&
+               (pp->outbuf.p[n - 1] == '\n' || pp->outbuf.p[n - 1] == '\r')) n--;
+        bj_builder_reset(pp->bld);
+        bj_put_string(pp->bld, pp->outbuf.p, (uint32_t)n);
+        body = bj_builder_data(pp->bld, &body_len);
+        if (!body) return 0;
+    }
+
+    /*
+     * Deterministic from the input, NOT from the output: rerunning a
+     * handler that is not perfectly deterministic must still collapse
+     * onto the message its first run produced.
+     */
+    char id[BJM_DEDUP_ID_MAX + 1];
+    snprintf(id, sizeof id, "%s.%s.%lld", o->consumer, o->subject, pp->index);
+
+    char url[1024];
+    snprintf(url, sizeof url,
+             "%s/pub/%s?id=%s&ack_subject=%s&ack_consumer=%s&ack_index=%lld",
+             o->url_base, o->to, id, o->subject, o->consumer, pp->index);
+    curl_easy_setopt(pp->pub.curl, CURLOPT_CUSTOMREQUEST, NULL);
+    curl_easy_setopt(pp->pub.curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(pp->pub.curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(pp->pub.curl, CURLOPT_POSTFIELDSIZE, (long)body_len);
+    if (!pp->pub.headers) {
+        pp->pub.headers = curl_slist_append(NULL,
+                                            "Content-Type: " BJMSG_MEDIA_TYPE);
+        curl_easy_setopt(pp->pub.curl, CURLOPT_HTTPHEADER, pp->pub.headers);
+    }
+
+    /*
+     * A publish is the one request that must not be blindly retried, but
+     * this one carries an idempotency key — so a retry that lands twice
+     * returns the original index instead of appending a second copy. That
+     * is exactly what the key is for.
+     */
+    long status = client_perform_ex(&pp->pub, url, 1);
+    if (status != 200) {
+        if (status > 0) report_error(&pp->pub, status);
+        return 0;
+    }
+    printf("%lld\t->\t%s\n", pp->index, o->to);
+    fflush(stdout);
+    return 1;
+}
+
+static void pp_key(void *ctx, const uint8_t *k, uint32_t len) {
+    piper *pp = ctx;
+    if (len >= sizeof pp->key) len = sizeof pp->key - 1;
+    memcpy(pp->key, k, len);
+    pp->key[len] = '\0';
+}
+
+static void pp_int(void *ctx, double v) {
+    piper *pp = ctx;
+    if (strcmp(pp->key, "index") == 0) pp->index = (long long)v;
+}
+
+static void pp_binary(void *ctx, const uint8_t *bytes, uint32_t len) {
+    piper *pp = ctx;
+    if (pp->stopped || strcmp(pp->key, "payload") != 0) return;
+    if (!pipe_one(pp, bytes, len)) { pp->stopped = 1; return; }
+    pp->took = (uint64_t)pp->index;
+}
+
+static void h_pipe(http11c_request *req, http11c_response *res) {
+    piper *pp = http11c_req_ctx(req);
+
+    if (pp->token[0]) {
+        const char *auth = http11c_req_header(req, "Authorization");
+        char want[BJM_TOKEN_MAX + 16];
+        snprintf(want, sizeof want, "Bearer %s", pp->token);
+        if (!auth || strcmp(auth, want) != 0) {
+            http11c_res_header(res, "Content-Type", "text/plain");
+            http11c_res_text(res, 401, "bad or missing bearer token\n");
+            return;
+        }
+    }
+
+    size_t len = 0;
+    const uint8_t *body = (const uint8_t *)http11c_req_body(req, &len);
+    if (!body || len == 0) {
+        http11c_res_header(res, "Content-Type", "text/plain");
+        http11c_res_text(res, 400, "empty delivery\n");
+        return;
+    }
+
+    pp->took = 0;
+    pp->stopped = 0;
+    pp->key[0] = '\0';
+
+    bj_visitor v = bjm_visitor_noop(pp);
+    v.on_key = pp_key;
+    v.on_int = pp_int;
+    v.on_binary = pp_binary;
+    if (bj_decode(body, len, &v, NULL) != BJ_OK) {
+        http11c_res_header(res, "Content-Type", "text/plain");
+        http11c_res_text(res, 400, "malformed delivery\n");
+        return;
+    }
+
+    /*
+     * Each published message already carried its own acknowledgement, so
+     * this is belt and braces for the ones that were dropped rather than
+     * published — and, when it is 0, the way to tell the broker nothing
+     * was taken so it waits before sending the batch again.
+     */
+    char ack[32];
+    snprintf(ack, sizeof ack, "%llu", (unsigned long long)pp->took);
+    http11c_res_header(res, "X-Bjmsg-Ack", ack);
+    http11c_res_header(res, "Content-Type", "text/plain");
+    http11c_res_text(res, 200, "");
+}
 
 int bjm_cmd_pipe(int argc, char **argv) {
     query_opts o;
@@ -2443,138 +2727,51 @@ int bjm_cmd_pipe(int argc, char **argv) {
         fputs(PIPE_USAGE, stderr);
         return 2;
     }
-    long idle = o.interval_ms > 0 ? o.interval_ms : DEFAULT_POLL_MS;
 
-    client c;
-    if (client_init(&c, o.retry_ms) != 0) return 1;
-
-    buf outbuf = {0};
-    bj_builder *bld = bj_builder_new();
-    if (!bld) { client_free(&c); return 1; }
-
-    rc = 0;
-    while (!g_stop) {
-        /* One at a time: the ack rides with the output, so a batch would
-         * have to be published before any of it could be acknowledged. */
-        char url[1024];
-        snprintf(url, sizeof url, "%s/sub/%s?consumer=%s&max=1",
-                 o.url_base, o.subject, o.consumer);
-        curl_easy_setopt(c.curl, CURLOPT_HTTPGET, 1L);
-        curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, NULL);
-
-        long status = client_perform(&c, url);
-        if (g_stop) break;
-        if (status < 0) { rc = 1; break; }
-        if (status != 200) {
-            if (status == 404 && o.follow) { sleep_ms(idle); continue; }
-            report_error(&c, status);
-            rc = 1;
-            break;
-        }
-
-        pipe_msg m;
-        memset(&m, 0, sizeof m);
-        bj_visitor v = bjm_visitor_noop(&m);
-        v.on_key = pm_key;
-        v.on_int = pm_int;
-        v.on_binary = pm_binary;
-        if (bj_decode(c.body.p, c.body.len, &v, NULL) != BJ_OK) {
-            fprintf(stderr, "bjmsg: malformed batch from broker\n");
-            rc = 1;
-            break;
-        }
-        if (!m.have) {
-            free(m.payload);
-            if (!o.follow) break;
-            sleep_ms(idle);
-            continue;
-        }
-
-        /* Hand the handler either the raw encoded message or its text
-         * rendering, and take its stdout back the same way. */
-        buf feed = {0};
-        feed_for(m.payload, m.plen, o.raw, &feed);
-
-        char env[32];
-        setenv("BJMSG_SUBJECT", o.subject, 1);
-        setenv("BJMSG_CONSUMER", o.consumer, 1);
-        snprintf(env, sizeof env, "%lld", m.index);
-        setenv("BJMSG_INDEX", env, 1);
-
-        int st = run_filter(o.exec, feed.p, feed.len, &outbuf);
-        buf_free(&feed);
-        free(m.payload);
-
-        if (st != 0) {
-            /* Not acknowledged, so the broker hands it back next poll. */
-            fprintf(stderr, "bjmsg: %lld failed (exit %d), not acknowledged\n",
-                    m.index, st);
-            rc = 1;
-            if (!o.follow) break;
-            sleep_ms(idle);
-            continue;
-        }
-
-        /*
-         * Deterministic from the input, NOT from the output: rerunning a
-         * handler that is not perfectly deterministic must still collapse
-         * onto the message its first run produced.
-         */
-        char id[BJM_DEDUP_ID_MAX + 1];
-        snprintf(id, sizeof id, "%s.%s.%lld", o.consumer, o.subject, m.index);
-
-        if (outbuf.len == 0) {
-            /* Nothing to publish — the handler dropped it. Acknowledge on
-             * its own so the input still makes progress. */
-            snprintf(url, sizeof url, "%s/ack/%s?consumer=%s&index=%lld",
-                     o.url_base, o.subject, o.consumer, m.index);
-            curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, "POST");
-            curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, "");
-            curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, 0L);
-            if (client_perform(&c, url) != 200) { rc = 1; break; }
-            printf("%lld\tdropped\n", m.index);
-            fflush(stdout);
-            continue;
-        }
-
-        const uint8_t *body = outbuf.p;
-        size_t body_len = outbuf.len;
-        if (!o.raw) {
-            /* Text out becomes a binjson STRING, trailing newline and all
-             * removed — a shell filter almost always adds one. */
-            size_t n = outbuf.len;
-            while (n > 0 && (outbuf.p[n - 1] == '\n' || outbuf.p[n - 1] == '\r')) n--;
-            bj_builder_reset(bld);
-            bj_put_string(bld, outbuf.p, (uint32_t)n);
-            body = bj_builder_data(bld, &body_len);
-            if (!body) { rc = 1; break; }
-        }
-
-        snprintf(url, sizeof url,
-                 "%s/pub/%s?id=%s&ack_subject=%s&ack_consumer=%s&ack_index=%lld",
-                 o.url_base, o.to, id, o.subject, o.consumer, m.index);
-        curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, NULL);
-        curl_easy_setopt(c.curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, body);
-        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, (long)body_len);
-        if (!c.headers) {
-            c.headers = curl_slist_append(NULL, "Content-Type: " BJMSG_MEDIA_TYPE);
-            curl_easy_setopt(c.curl, CURLOPT_HTTPHEADER, c.headers);
-        }
-
-        status = client_perform(&c, url);
-        if (status != 200) {
-            if (status > 0) report_error(&c, status);
-            rc = 1;
-            break;
-        }
-        printf("%lld\t->\t%s\n", m.index, o.to);
-        fflush(stdout);
+    const char *token = o.token;
+    const char *consumer = o.consumer;
+    char generated[BJM_CONSUMER_MAX + 1], auto_token[65];
+    if (receiver_identity(&consumer, generated, sizeof generated, "pipe",
+                          &token, auto_token, sizeof auto_token) != 0) {
+        fprintf(stderr, "bjmsg: cannot read /dev/urandom\n");
+        return 1;
     }
 
-    bj_builder_free(bld);
-    buf_free(&outbuf);
-    client_free(&c);
+    piper pp;
+    memset(&pp, 0, sizeof pp);
+    snprintf(pp.path, sizeof pp.path, "/stage");
+    snprintf(pp.token, sizeof pp.token, "%s", token);
+    pp.o = o;
+    pp.bld = bj_builder_new();
+    if (!pp.bld) return 1;
+    if (client_init(&pp.pub, o.retry_ms) != 0) {
+        bj_builder_free(pp.bld);
+        return 1;
+    }
+
+    receiver_spec sp;
+    memset(&sp, 0, sizeof sp);
+    sp.url_base = o.url_base;
+    sp.pattern = o.subject;
+    sp.consumer = o.consumer;   /* named: a stage keeps its place */
+    sp.bind_addr = o.bind_addr;
+    sp.callback = o.callback;
+    sp.token = token;
+    sp.path = pp.path;
+    sp.retry_ms = o.retry_ms;
+    sp.heartbeat_ms = DEFAULT_HEARTBEAT_MS;
+    sp.port = o.port;
+    /* A stage is durable by definition — its consumer is where the
+     * pipeline resumes — so its receipt outlives the process. */
+    sp.keep = 0;
+    sp.ephemeral = 0;
+    sp.handler = h_pipe;
+    sp.ctx = &pp;
+    rc = receiver_run(&sp);
+
+    client_free(&pp.pub);
+    bj_builder_free(pp.bld);
+    buf_free(&pp.outbuf);
     return rc;
 }
 
