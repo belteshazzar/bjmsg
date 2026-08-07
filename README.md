@@ -170,6 +170,62 @@ BEGIN; insert result; update last_index = 42; COMMIT;   -- skip anything <= 42
 Exactly-once *delivery* is not a thing anyone can offer; this is the pair
 of mechanisms that gets you exactly-once *effect*.
 
+## Headers
+
+A message can carry headers. They live in the entry log's **type byte** —
+which is already in every subscribe response — rather than in a wrapper
+every message has to pay for:
+
+| entry type | payload |
+| --- | --- |
+| `0x01` plain | the message, byte-for-byte as published |
+| `0x10` envelope | `[ headers, message ]` |
+
+So a headerless message is untouched and the subscribe path still
+forwards `elog_get_batch`'s bytes verbatim; only messages that actually
+have headers carry the array. A subscriber tells them apart by the `type`
+field it already receives.
+
+```sh
+bjmsg pub orders "an order" --header source=web --header trace=abc123
+bjmsg sub orders
+2  [{"source":"web","trace":"abc123"},"an order"]
+```
+
+Headers are **opaque to the broker** — it checks the shape on publish, so
+a subscriber trusting the type byte cannot trip over a mislabelled
+payload, and looks at nothing else. They are not stored as HTTP headers
+because http11c has no way to enumerate request headers, only to look one
+up by name.
+
+## Request-reply
+
+```sh
+bjmsg reply echo --exec 'tr a-z A-Z'      # a responder (run as many as you like)
+bjmsg request echo "hello world"          # → "HELLO WORLD"
+```
+
+The request carries `reply_to` and `correlation` headers. The reply goes
+to `reply_to` with the same correlation, and the requester matches on it —
+so many requesters share one reply subject (`_reply` by default) without
+needing one each. `--timeout` bounds the wait and exits 1 if it passes.
+
+Two details that make it hold up:
+
+- The requester reads the reply subject's **current end before publishing
+  the request**, so a reply that arrives before it starts polling is not
+  missed.
+- Responders share a **queue group**, so each request is handled once no
+  matter how many are running, and the reply is published with an
+  idempotency key derived from the correlation — a redelivered request
+  cannot produce a second reply.
+
+Measured: 12 concurrent requesters against 3 competing responders, all 12
+correlated correctly, 12 requests and 12 replies.
+
+A request whose handler needs no answer is fine too — a message with no
+`reply_to` is run and acknowledged without a reply.
+
 ## Effectively-once pipelines
 
 `bjmsg pipe` reads a subject, transforms each message, and publishes the

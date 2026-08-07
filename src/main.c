@@ -37,6 +37,8 @@ static void usage(void) {
         "  bjmsg dead        [--url URL] <subject>\n"
         "  bjmsg requeue     [--url URL] <subject> --index N\n"
         "  bjmsg pipe        [--url URL] <in> --consumer N --to <out> --exec CMD\n"
+        "  bjmsg request     [--url URL] <subject> <text> [--timeout D]\n"
+        "  bjmsg reply       [--url URL] <subject> --exec CMD [--group G]\n"
         "\n"
         "query a running broker and exit:\n"
         "  bjmsg health      [--url URL]\n"
@@ -116,6 +118,8 @@ int main(int argc, char **argv) {
         { "dead",        bjm_cmd_dead },
         { "requeue",     bjm_cmd_requeue },
         { "pipe",        bjm_cmd_pipe },
+        { "request",     bjm_cmd_request },
+        { "reply",       bjm_cmd_reply },
     };
 
     for (size_t i = 0; i < sizeof clients / sizeof *clients; i++) {

@@ -139,6 +139,22 @@ static void h_publish(http11c_request *req, http11c_response *res) {
     }
 
     /*
+     * ?headers=1 says the body is [ headers, message ] rather than the
+     * message alone. The shape is checked here — a subscriber trusts the
+     * entry type and would otherwise trip over a mislabelled payload —
+     * but the contents of the headers object are never looked at.
+     */
+    int entry_type = BJM_ENTRY_PLAIN;
+    if (query_u64(req, "headers", 0)) {
+        if (!bjm_envelope_shape_ok(body, len)) {
+            res_err(res, 400, "with ?headers=1 the body must be a 2-element "
+                              "array: [ headers-object, message ]\n");
+            return;
+        }
+        entry_type = BJM_ENTRY_ENVELOPE;
+    }
+
+    /*
      * An idempotency key makes this publish safe to repeat: if the id has
      * been seen inside the dedup window, the original index is returned
      * and nothing is appended. Look it up before the append, so a retry
@@ -160,7 +176,8 @@ static void h_publish(http11c_request *req, http11c_response *res) {
     }
 
     if (!duplicate) {
-        int e = bjm_publish(a->store, subject, body, (uint32_t)len, &index);
+        int e = bjm_publish(a->store, subject, entry_type, body,
+                            (uint32_t)len, &index);
         if (e) {
             res_err(res, status_for(e), "publish failed\n");
             return;
@@ -887,7 +904,7 @@ static void h_not_found(http11c_request *req, http11c_response *res) {
     (void)req;
     res_err(res, 404,
         "no such route. available:\n"
-        "  POST   /pub/<subject>[?id=][&ack_subject=&ack_consumer=&ack_index=]\n"
+        "  POST   /pub/<subject>[?id=][&headers=1][&ack_subject=&ack_consumer=&ack_index=]\n"
         "  GET    /sub/<subject>?from=|consumer=\n"
         "  POST   /ack/<subject>?consumer=&index=\n"
         "  POST   /trim/<subject>?before=|keep=[&force=1]\n"

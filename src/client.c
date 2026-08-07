@@ -257,6 +257,8 @@ static void pub_usage(void) {
         "  --int N      publish a binjson INT\n"
         "  --file PATH  publish PATH's bytes verbatim (already-encoded\n"
         "               binjson); PATH may be - for stdin\n"
+        "  --header k=v add a header (repeatable). Headers travel with the\n"
+        "               message and are opaque to the broker.\n"
         "  --id KEY     idempotency key. Republishing the same key inside\n"
         "               the broker's dedup window returns the original\n"
         "               index instead of appending again.\n"
@@ -287,6 +289,8 @@ static void make_auto_id(char *out, size_t cap) {
 int bjm_cmd_pub(int argc, char **argv) {
     const char *url_base = DEFAULT_URL;
     const char *subject = NULL, *text = NULL, *file = NULL, *id = NULL;
+    const char *hdr[16];
+    int nhdr = 0;
     int have_int = 0, auto_id = 0;
     long long int_value = 0;
     long retry_ms = DEFAULT_RETRY_MS;
@@ -302,6 +306,18 @@ int bjm_cmd_pub(int argc, char **argv) {
                                 "(0 to disable)\n");
                 return 2;
             }
+        } else if (strcmp(a, "--header") == 0 || strcmp(a, "-H") == 0) {
+            const char *v = arg_value(argc, argv, &i, "--header");
+            if (!v) return 2;
+            if (!strchr(v, '=')) {
+                fprintf(stderr, "bjmsg: --header wants name=value\n");
+                return 2;
+            }
+            if (nhdr == (int)(sizeof hdr / sizeof hdr[0])) {
+                fprintf(stderr, "bjmsg: too many headers\n");
+                return 2;
+            }
+            hdr[nhdr++] = v;
         } else if (strcmp(a, "--id") == 0) {
             if (!(id = arg_value(argc, argv, &i, "--id"))) return 2;
         } else if (strcmp(a, "--auto-id") == 0) {
@@ -351,8 +367,22 @@ int bjm_cmd_pub(int argc, char **argv) {
     } else {
         b = bj_builder_new();
         if (!b) return 1;
+        /* With headers the message becomes [ {headers}, message ]; the
+         * broker stores that under the envelope entry type. */
+        if (nhdr) {
+            bj_begin_array(b);
+            bj_begin_object(b);
+            for (int i = 0; i < nhdr; i++) {
+                const char *eq = strchr(hdr[i], '=');
+                bj_put_key(b, (const uint8_t *)hdr[i], (uint32_t)(eq - hdr[i]));
+                bj_put_string(b, (const uint8_t *)(eq + 1),
+                              (uint32_t)strlen(eq + 1));
+            }
+            bj_end_object(b);
+        }
         if (have_int) bj_put_int(b, int_value);
         else bj_put_string(b, (const uint8_t *)text, (uint32_t)strlen(text));
+        if (nhdr) bj_end_array(b);
         size_t len = 0;
         const uint8_t *d = bj_builder_data(b, &len);
         if (!d || buf_append(&payload, d, len) != 0) {
@@ -379,10 +409,10 @@ int bjm_cmd_pub(int argc, char **argv) {
     }
 
     char url[1024];
-    if (id)
-        snprintf(url, sizeof url, "%s/pub/%s?id=%s", url_base, subject, id);
-    else
-        snprintf(url, sizeof url, "%s/pub/%s", url_base, subject);
+    int n = snprintf(url, sizeof url, "%s/pub/%s?", url_base, subject);
+    if (id) n += snprintf(url + n, sizeof url - n, "id=%s&", id);
+    if (nhdr) n += snprintf(url + n, sizeof url - n, "headers=1&");
+    if (n > 0 && (size_t)n < sizeof url) url[n - 1] = '\0';   /* trailing & or ? */
 
     int rc = 1;
     /*
@@ -678,6 +708,8 @@ typedef struct {
     int         max;
     long        retry_ms, interval_ms;
     int         force, clear, del, ignore_consumers;
+    const char *text;      /* second positional, for request */
+    uint64_t    timeout_ms;
     int         raw, follow;
 } query_opts;
 
@@ -729,6 +761,16 @@ static int query_parse(int argc, char **argv, query_opts *o, const char *usage) 
             if (!(o->exec = arg_value(argc, argv, &i, "--exec"))) return 2;
         } else if (strcmp(a, "--to") == 0) {
             if (!(o->to = arg_value(argc, argv, &i, "--to"))) return 2;
+        } else if (strcmp(a, "--reply-to") == 0) {
+            if (!(o->to = arg_value(argc, argv, &i, "--reply-to"))) return 2;
+        } else if (strcmp(a, "--timeout") == 0) {
+            const char *v = arg_value(argc, argv, &i, "--timeout");
+            uint64_t secs;
+            if (!v || parse_duration(v, &secs) != 0) {
+                fprintf(stderr, "bjmsg: --timeout wants a duration like 5s\n");
+                return 2;
+            }
+            o->timeout_ms = secs * 1000;
         } else if (strcmp(a, "--raw") == 0) {
             o->raw = 1;
         } else if (strcmp(a, "--follow") == 0 || strcmp(a, "-f") == 0) {
@@ -806,6 +848,8 @@ static int query_parse(int argc, char **argv, query_opts *o, const char *usage) 
             return 2;
         } else if (!o->subject) {
             o->subject = a;
+        } else if (!o->text) {
+            o->text = a;
         } else {
             fprintf(stderr, "bjmsg: unexpected argument %s\n", a);
             return 2;
@@ -1259,6 +1303,405 @@ int bjm_cmd_work(int argc, char **argv) {
 
     client_free(&c);
     return rc ? rc : (failures ? 1 : 0);
+}
+
+/* ---- request / reply ---------------------------------------------------- */
+
+/* Both defined with the pipeline machinery below, which is where they
+ * carry the most weight; a replier runs a handler the same way. */
+static void feed_for(const uint8_t *payload, size_t plen, int raw, buf *out);
+static int run_filter(const char *cmd, const uint8_t *in, size_t in_len,
+                      buf *out);
+
+#define REPLY_SUBJECT_DEFAULT "_reply"
+#define REPLY_GROUP_DEFAULT   "repliers"
+
+/* Read one named header out of an encoded headers object. */
+typedef struct {
+    const char *want;
+    char        key[64];
+    char        value[BJM_SUBJECT_MAX + 1];
+    int         got;
+} hdr_get;
+
+static void hg_key(void *ctx, const uint8_t *k, uint32_t len) {
+    hdr_get *h = ctx;
+    if (len >= sizeof h->key) len = sizeof h->key - 1;
+    memcpy(h->key, k, len);
+    h->key[len] = '\0';
+}
+
+static void hg_string(void *ctx, const uint8_t *v, uint32_t len) {
+    hdr_get *h = ctx;
+    if (h->got || strcmp(h->key, h->want) != 0) return;
+    if (len >= sizeof h->value) len = sizeof h->value - 1;
+    memcpy(h->value, v, len);
+    h->value[len] = '\0';
+    h->got = 1;
+}
+
+static int header_value(const uint8_t *headers, size_t len, const char *name,
+                        char *out, size_t out_size) {
+    hdr_get h;
+    memset(&h, 0, sizeof h);
+    h.want = name;
+    bj_visitor v = bjm_visitor_noop(&h);
+    v.on_key = hg_key;
+    v.on_string = hg_string;
+    if (bj_decode(headers, len, &v, NULL) != BJ_OK || !h.got) return 0;
+    snprintf(out, out_size, "%s", h.value);
+    return 1;
+}
+
+/* Publish `body` with { correlation: id } attached, to `subject`. */
+static long publish_reply(client *c, const query_opts *o, const char *subject,
+                          const char *correlation, const uint8_t *msg,
+                          size_t msg_len) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return -1;
+    bj_begin_array(b);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"correlation", 11);
+    bj_put_string(b, (const uint8_t *)correlation, (uint32_t)strlen(correlation));
+    bj_end_object(b);
+    bj_put_raw(b, msg, (uint32_t)msg_len);
+    bj_end_array(b);
+
+    size_t len = 0;
+    const uint8_t *data = bj_builder_data(b, &len);
+    if (!data) { bj_builder_free(b); return -1; }
+
+    char url[1024];
+    /* Keyed on the correlation id, so a redelivered request cannot
+     * produce a second reply. */
+    snprintf(url, sizeof url, "%s/pub/%s?headers=1&id=reply.%s",
+             o->url_base, subject, correlation);
+    if (!c->headers) {
+        c->headers = curl_slist_append(NULL, "Content-Type: " BJMSG_MEDIA_TYPE);
+        curl_easy_setopt(c->curl, CURLOPT_HTTPHEADER, c->headers);
+    }
+    curl_easy_setopt(c->curl, CURLOPT_CUSTOMREQUEST, NULL);
+    curl_easy_setopt(c->curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(c->curl, CURLOPT_POSTFIELDS, data);
+    curl_easy_setopt(c->curl, CURLOPT_POSTFIELDSIZE, (long)len);
+    long status = client_perform(c, url);
+    bj_builder_free(b);
+    return status;
+}
+
+/*
+ * Walks every message of a batch looking for one correlation id. Each
+ * batch entry is a flat object, so on_object_end is one message — which
+ * matters when several requesters share a reply subject and another's
+ * reply arrives in the same batch as ours.
+ */
+typedef struct {
+    char        key[16];
+    long long   index, type;
+    const uint8_t *payload;
+    size_t      plen;
+    const char *want;
+    uint64_t    highest;   /* to advance the cursor past what we read */
+    int         matched;
+} corr_scan;
+
+static void cs_key(void *ctx, const uint8_t *k, uint32_t len) {
+    corr_scan *s = ctx;
+    if (len >= sizeof s->key) len = sizeof s->key - 1;
+    memcpy(s->key, k, len);
+    s->key[len] = '\0';
+}
+
+static void cs_int(void *ctx, double v) {
+    corr_scan *s = ctx;
+    if (strcmp(s->key, "index") == 0)     s->index = (long long)v;
+    else if (strcmp(s->key, "type") == 0) s->type = (long long)v;
+}
+
+/* Valid only for the duration of the decode, which is where it is used. */
+static void cs_binary(void *ctx, const uint8_t *b, uint32_t len) {
+    corr_scan *s = ctx;
+    if (strcmp(s->key, "payload") != 0) return;
+    s->payload = b;
+    s->plen = len;
+}
+
+static void cs_object_end(void *ctx) {
+    corr_scan *s = ctx;
+    if ((uint64_t)s->index > s->highest) s->highest = (uint64_t)s->index;
+
+    const uint8_t *h, *msg;
+    size_t hlen, mlen;
+    char got[96];
+    if (!s->matched && s->type == BJM_ENTRY_ENVELOPE && s->payload &&
+        bjm_envelope_split(s->payload, s->plen, &h, &hlen, &msg, &mlen) &&
+        header_value(h, hlen, "correlation", got, sizeof got) &&
+        strcmp(got, s->want) == 0) {
+        bjm_render(stdout, msg, mlen);
+        fputc('\n', stdout);
+        s->matched = 1;
+    }
+    s->payload = NULL;
+    s->plen = 0;
+    s->type = 0;
+}
+
+/* A message from a subscribe batch: index, entry type, payload. */
+typedef struct {
+    char      key[16];
+    long long index, type;
+    uint8_t  *payload;
+    size_t    plen;
+    int       have;
+} rr_msg;
+
+static void rr_key(void *ctx, const uint8_t *k, uint32_t len) {
+    rr_msg *m = ctx;
+    if (len >= sizeof m->key) len = sizeof m->key - 1;
+    memcpy(m->key, k, len);
+    m->key[len] = '\0';
+}
+
+static void rr_int(void *ctx, double v) {
+    rr_msg *m = ctx;
+    if (m->have) return;
+    if (strcmp(m->key, "index") == 0)     m->index = (long long)v;
+    else if (strcmp(m->key, "type") == 0) m->type = (long long)v;
+}
+
+static void rr_binary(void *ctx, const uint8_t *b, uint32_t len) {
+    rr_msg *m = ctx;
+    if (m->have || strcmp(m->key, "payload") != 0) return;
+    m->payload = malloc(len ? len : 1);
+    if (!m->payload) return;
+    memcpy(m->payload, b, len);
+    m->plen = len;
+    m->have = 1;
+}
+
+/* The subject's highest index, or 0. Used to start tailing replies from
+ * the end BEFORE the request goes out, so a fast reply is not missed. */
+static uint64_t subject_last_index(client *c, const query_opts *o,
+                                   const char *subject) {
+    char url[1024];
+    snprintf(url, sizeof url, "%s/sub/%s?from=%llu",
+             o->url_base, subject, (unsigned long long)UINT64_MAX);
+    curl_easy_setopt(c->curl, CURLOPT_CUSTOMREQUEST, NULL);
+    curl_easy_setopt(c->curl, CURLOPT_HTTPGET, 1L);
+    c->last_index = 0;
+    long status = client_perform(c, url);
+    return status == 200 ? c->last_index : 0;
+}
+
+#define REQUEST_USAGE \
+    "usage: bjmsg request [--url URL] <subject> <text> [--timeout D]\n" \
+    "                     [--reply-to SUBJECT]\n" \
+    "\n" \
+    "Publish a request and wait for its reply. The request carries\n" \
+    "reply_to and correlation headers; the reply is matched on the\n" \
+    "correlation, so many requesters can share one reply subject.\n" \
+    "\n" \
+    "  --timeout D    how long to wait (default 5s); exits 1 on timeout\n" \
+    "  --reply-to S   reply subject (default " REPLY_SUBJECT_DEFAULT ")\n"
+
+int bjm_cmd_request(int argc, char **argv) {
+    query_opts o;
+    int rc = query_parse(argc, argv, &o, REQUEST_USAGE);
+    if (rc) return rc == 1 ? 0 : rc;
+    const char *text = o.text;
+    const char *reply_to = o.to ? o.to : REPLY_SUBJECT_DEFAULT;
+    if (!o.subject || !bjm_subject_valid(o.subject) || !text ||
+        !bjm_subject_valid(reply_to)) {
+        fputs(REQUEST_USAGE, stderr);
+        return 2;
+    }
+    uint64_t timeout_ms = o.timeout_ms ? o.timeout_ms : 5000;
+    long idle = o.interval_ms > 0 ? o.interval_ms : 100;
+
+    char corr[64];
+    make_auto_id(corr, sizeof corr);
+
+    client c;
+    if (client_init(&c, o.retry_ms) != 0) return 1;
+
+    /* Where the reply subject ends now, before the request exists. */
+    uint64_t from = subject_last_index(&c, &o, reply_to) + 1;
+
+    bj_builder *b = bj_builder_new();
+    if (!b) { client_free(&c); return 1; }
+    bj_begin_array(b);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"reply_to", 8);
+    bj_put_string(b, (const uint8_t *)reply_to, (uint32_t)strlen(reply_to));
+    bj_put_key(b, (const uint8_t *)"correlation", 11);
+    bj_put_string(b, (const uint8_t *)corr, (uint32_t)strlen(corr));
+    bj_end_object(b);
+    bj_put_string(b, (const uint8_t *)text, (uint32_t)strlen(text));
+    bj_end_array(b);
+
+    size_t len = 0;
+    const uint8_t *data = bj_builder_data(b, &len);
+    char url[1024];
+    snprintf(url, sizeof url, "%s/pub/%s?headers=1&id=req.%s",
+             o.url_base, o.subject, corr);
+    c.headers = curl_slist_append(NULL, "Content-Type: " BJMSG_MEDIA_TYPE);
+    curl_easy_setopt(c.curl, CURLOPT_HTTPHEADER, c.headers);
+    curl_easy_setopt(c.curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, data);
+    curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, (long)len);
+
+    rc = 1;
+    if (client_perform(&c, url) != 200) {
+        fprintf(stderr, "bjmsg: request could not be published\n");
+        goto done;
+    }
+
+    for (uint64_t waited = 0; waited < timeout_ms && !g_stop;
+         waited += (uint64_t)idle) {
+        snprintf(url, sizeof url, "%s/sub/%s?from=%llu",
+                 o.url_base, reply_to, (unsigned long long)from);
+        curl_easy_setopt(c.curl, CURLOPT_HTTPGET, 1L);
+        curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, NULL);
+
+        long status = client_perform(&c, url);
+        if (status == 404) { sleep_ms(idle); continue; }
+        if (status != 200) { report_error(&c, status); goto done; }
+
+        /* Every message in the batch: on a shared reply subject most of
+         * them belong to other requesters. */
+        corr_scan sc;
+        memset(&sc, 0, sizeof sc);
+        sc.want = corr;
+        bj_visitor v = bjm_visitor_noop(&sc);
+        v.on_key = cs_key;
+        v.on_int = cs_int;
+        v.on_binary = cs_binary;
+        v.on_object_end = cs_object_end;
+        if (bj_decode(c.body.p, c.body.len, &v, NULL) != BJ_OK) {
+            fprintf(stderr, "bjmsg: malformed reply batch\n");
+            goto done;
+        }
+        if (sc.highest >= from) from = sc.highest + 1;
+        if (sc.matched) { rc = 0; goto done; }
+        sleep_ms(idle);
+    }
+    if (rc) fprintf(stderr, "bjmsg: no reply within %llums\n",
+                    (unsigned long long)timeout_ms);
+
+done:
+    bj_builder_free(b);
+    client_free(&c);
+    return rc;
+}
+
+#define REPLY_USAGE \
+    "usage: bjmsg reply [--url URL] <subject> --exec CMD [--group G]\n" \
+    "                   [--interval MS]\n" \
+    "\n" \
+    "Serve requests on <subject>: run CMD for each, publish its stdout to\n" \
+    "the request's reply_to with the same correlation. Repliers share a\n" \
+    "queue group (default " REPLY_GROUP_DEFAULT "), so each request is\n" \
+    "handled once however many are running.\n"
+
+int bjm_cmd_reply(int argc, char **argv) {
+    query_opts o;
+    int rc = query_parse(argc, argv, &o, REPLY_USAGE);
+    if (rc) return rc == 1 ? 0 : rc;
+    const char *group = o.group ? o.group : REPLY_GROUP_DEFAULT;
+    if (!o.subject || !bjm_subject_valid(o.subject) || !o.exec ||
+        !bjm_group_valid(group)) {
+        fputs(REPLY_USAGE, stderr);
+        return 2;
+    }
+    long idle = o.interval_ms > 0 ? o.interval_ms : DEFAULT_POLL_MS;
+
+    client c;
+    if (client_init(&c, o.retry_ms) != 0) return 1;
+    buf out = {0};
+
+    rc = 0;
+    while (!g_stop) {
+        char url[1024];
+        snprintf(url, sizeof url, "%s/take/%s?group=%s&max=1",
+                 o.url_base, o.subject, group);
+        curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, "POST");
+        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, "");
+        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, 0L);
+
+        long status = client_perform(&c, url);
+        if (g_stop) break;
+        if (status < 0) { rc = 1; break; }
+        if (status == 404) { sleep_ms(idle); continue; }
+        if (status != 200) { report_error(&c, status); rc = 1; break; }
+
+        rr_msg m;
+        memset(&m, 0, sizeof m);
+        bj_visitor v = bjm_visitor_noop(&m);
+        v.on_key = rr_key;
+        v.on_int = rr_int;
+        v.on_binary = rr_binary;
+        if (bj_decode(c.body.p, c.body.len, &v, NULL) != BJ_OK) {
+            fprintf(stderr, "bjmsg: malformed take response\n");
+            rc = 1;
+            break;
+        }
+        if (!m.have) { free(m.payload); sleep_ms(idle); continue; }
+
+        const uint8_t *h = NULL, *msg = m.payload;
+        size_t hlen = 0, mlen = m.plen;
+        char reply_to[BJM_SUBJECT_MAX + 1] = "", corr[64] = "";
+        if (m.type == BJM_ENTRY_ENVELOPE)
+            bjm_envelope_split(m.payload, m.plen, &h, &hlen, &msg, &mlen);
+        if (h) {
+            header_value(h, hlen, "reply_to", reply_to, sizeof reply_to);
+            header_value(h, hlen, "correlation", corr, sizeof corr);
+        }
+
+        buf feed = {0};
+        feed_for(msg, mlen, 0, &feed);
+        int st = run_filter(o.exec, feed.p, feed.len, &out);
+        buf_free(&feed);
+
+        int ok = (st == 0);
+        int replied = 0;
+        if (ok && reply_to[0] && corr[0]) {
+            size_t n = out.len;
+            while (n > 0 && (out.p[n - 1] == '\n' || out.p[n - 1] == '\r')) n--;
+            bj_builder *rb = bj_builder_new();
+            if (rb) {
+                bj_put_string(rb, out.p, (uint32_t)n);
+                size_t rlen = 0;
+                const uint8_t *rdata = bj_builder_data(rb, &rlen);
+                if (rdata &&
+                    publish_reply(&c, &o, reply_to, corr, rdata, rlen) != 200) {
+                    fprintf(stderr, "bjmsg: could not publish the reply\n");
+                    ok = 0;
+                } else if (rdata) {
+                    replied = 1;
+                }
+                bj_builder_free(rb);
+            }
+        }
+
+        snprintf(url, sizeof url, "%s/%s/%s?group=%s&index=%lld",
+                 o.url_base, ok ? "done" : "fail", o.subject, group, m.index);
+        curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, "POST");
+        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, "");
+        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, 0L);
+        client_perform(&c, url);
+
+        /* A request with no reply_to is legitimate — fire and forget —
+         * but saying "replied" when nothing was sent would hide the
+         * header extraction silently failing. */
+        printf("%lld\t%s\n", m.index,
+               !ok ? "failed" : replied ? "replied" : "done (no reply_to)");
+        fflush(stdout);
+        free(m.payload);
+    }
+
+    buf_free(&out);
+    client_free(&c);
+    return rc;
 }
 
 /* ---- effectively-once pipelines ---------------------------------------- */

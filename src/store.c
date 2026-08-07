@@ -227,13 +227,13 @@ static int subject_get(bjm_store *st, const char *name, int create, subject **ou
 
 /* ---- publish / read -------------------------------------------------- */
 
-int bjm_publish(bjm_store *st, const char *subject_name,
+int bjm_publish(bjm_store *st, const char *subject_name, int entry_type,
                 const uint8_t *payload, uint32_t len, uint64_t *out_index) {
     subject *s;
     int e = subject_get(st, subject_name, 1, &s);
     if (e) return e;
 
-    e = elog_append(s->log, 0, EL_NORMAL, payload, len, out_index);
+    e = elog_append(s->log, 0, entry_type, payload, len, out_index);
     if (e) return e;
     /*
      * One fsync per publish. elog_append only buffers, so a batching
@@ -1310,6 +1310,10 @@ int bjm_take(bjm_store *st, const char *subject_name, const char *group,
         bj_put_int(b, (int64_t)attempts[i]);
         bj_put_key(b, (const uint8_t *)"expires_ms", 10);
         bj_put_int(b, (int64_t)(lease_ms ? now + lease_ms : 0));
+        /* As elog_get_batch does for a subscribe: without it a worker
+         * cannot tell a headers envelope from a plain message. */
+        bj_put_key(b, (const uint8_t *)"type", 4);
+        bj_put_int(b, type);
         bj_put_key(b, (const uint8_t *)"payload", 7);
         bj_put_binary(b, payload, (uint32_t)plen);
         bj_end_object(b);
@@ -1354,6 +1358,10 @@ int bjm_take(bjm_store *st, const char *subject_name, const char *group,
             bj_put_int(d, (int64_t)dead_att[i]);
             bj_put_key(d, (const uint8_t *)"failed_ms", 9);
             bj_put_int(d, (int64_t)now);
+            /* So a requeue restores the message's shape, not just its
+             * bytes: a headers envelope must come back as one. */
+            bj_put_key(d, (const uint8_t *)"type", 4);
+            bj_put_int(d, dtype);
             /* BINARY rather than spliced raw: requeue has to hand these
              * exact bytes back to the log, and a binary field gives the
              * decoder their extent for free. */
@@ -1364,7 +1372,7 @@ int bjm_take(bjm_store *st, const char *subject_name, const char *group,
             size_t dlen = 0;
             const uint8_t *dv = bj_builder_data(d, &dlen);
             uint64_t at = 0;
-            if (dv) bjm_publish(st, dead, dv, (uint32_t)dlen, &at);
+            if (dv) bjm_publish(st, dead, BJM_ENTRY_PLAIN, dv, (uint32_t)dlen, &at);
         }
     }
 
@@ -1380,6 +1388,7 @@ typedef struct {
     char     subject[BJM_SUBJECT_MAX + 1];
     uint8_t *payload;
     size_t   plen;
+    int      type;
 } envelope;
 
 static void env_key(void *ctx, const uint8_t *k, uint32_t len) {
@@ -1395,6 +1404,11 @@ static void env_string(void *ctx, const uint8_t *sv, uint32_t len) {
     if (len > BJM_SUBJECT_MAX) len = BJM_SUBJECT_MAX;
     memcpy(v->subject, sv, len);
     v->subject[len] = '\0';
+}
+
+static void env_int(void *ctx, double v) {
+    envelope *e = ctx;
+    if (strcmp(e->key, "type") == 0) e->type = (int)v;
 }
 
 static void env_binary(void *ctx, const uint8_t *b, uint32_t len) {
@@ -1425,9 +1439,11 @@ int bjm_requeue(bjm_store *st, const char *subject_name, uint64_t dlq_index,
 
     envelope v;
     memset(&v, 0, sizeof v);
+    v.type = BJM_ENTRY_PLAIN;      /* records written before types existed */
     bj_visitor vis = bjm_visitor_noop(&v);
     vis.on_key = env_key;
     vis.on_string = env_string;
+    vis.on_int = env_int;
     vis.on_binary = env_binary;
     e = bj_decode(rec, rlen, &vis, NULL);
     if (e || !v.payload || !bjm_subject_valid(v.subject)) {
@@ -1437,7 +1453,7 @@ int bjm_requeue(bjm_store *st, const char *subject_name, uint64_t dlq_index,
 
     /* Back to the subject the envelope names, not the one asked for: a
      * requeue must not be able to move a message between subjects. */
-    e = bjm_publish(st, v.subject, v.payload, (uint32_t)v.plen, new_index);
+    e = bjm_publish(st, v.subject, v.type, v.payload, (uint32_t)v.plen, new_index);
     free(v.payload);
     return e;
 }

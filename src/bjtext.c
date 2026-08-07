@@ -144,6 +144,77 @@ bj_visitor bjm_visitor_noop(void *ctx) {
     return v;
 }
 
+/* ---- envelope shape ---------------------------------------------------- */
+
+/*
+ * Only the first two callbacks matter: a top-level ARRAY of exactly two,
+ * opening with an OBJECT. Whatever is nested below is the publisher's.
+ */
+typedef struct { int seen; int ok; } shape;
+
+static void shape_array(void *ctx, uint32_t count) {
+    shape *s = ctx;
+    if (s->seen++ == 0 && count == 2) s->ok = 1;
+}
+
+static void shape_object(void *ctx, uint32_t count) {
+    shape *s = ctx;
+    (void)count;
+    if (s->seen++ == 1 && s->ok) s->ok = 2;
+}
+
+static void shape_other(void *ctx) {
+    shape *s = ctx;
+    if (s->seen++ < 2) s->ok = 0;
+}
+
+static void shape_i(void *ctx, int v)                       { (void)v; shape_other(ctx); }
+static void shape_d(void *ctx, double v)                    { (void)v; shape_other(ctx); }
+static void shape_b(void *ctx, const uint8_t *p, uint32_t n){ (void)p; (void)n; shape_other(ctx); }
+static void shape_p(void *ctx, const uint8_t *p)            { (void)p; shape_other(ctx); }
+
+int bjm_envelope_shape_ok(const uint8_t *data, size_t len) {
+    shape s = { 0, 0 };
+    bj_visitor v = bjm_visitor_noop(&s);
+    v.on_array_begin = shape_array;
+    v.on_object_begin = shape_object;
+    v.on_null = shape_other;
+    v.on_bool = shape_i;
+    v.on_int = shape_d;
+    v.on_float = shape_d;
+    v.on_string = shape_b;
+    v.on_binary = shape_b;
+    v.on_oid = shape_p;
+    v.on_date = shape_d;
+    v.on_pointer = shape_d;
+    if (bj_decode(data, len, &v, NULL) != BJ_OK) return 0;
+    return s.ok == 2;
+}
+
+/*
+ * FORMAT.md: an ARRAY is the type byte, a uint32 content size, a uint32
+ * element count, then the elements — so element 0 starts at offset 9.
+ * The arithmetic is checked rather than trusted: the two element sizes
+ * must account for exactly the rest of the buffer, which also proves
+ * there are exactly two.
+ */
+int bjm_envelope_split(const uint8_t *data, size_t len,
+                       const uint8_t **headers, size_t *headers_len,
+                       const uint8_t **message, size_t *message_len) {
+    const size_t hdr = 1 + 4 + 4;
+    if (len <= hdr || data[0] != BJ_TYPE_ARRAY) return 0;
+
+    size_t s0 = 0, s1 = 0;
+    if (bj_value_size(data, len, hdr, &s0) != BJ_OK) return 0;
+    if (hdr + s0 >= len) return 0;
+    if (bj_value_size(data, len, hdr + s0, &s1) != BJ_OK) return 0;
+    if (hdr + s0 + s1 != len) return 0;
+
+    *headers = data + hdr;      *headers_len = s0;
+    *message = data + hdr + s0; *message_len = s1;
+    return 1;
+}
+
 int bjm_render(FILE *f, const uint8_t *data, size_t len) {
     rctx c;
     memset(&c, 0, sizeof c);

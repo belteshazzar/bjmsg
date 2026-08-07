@@ -24,6 +24,21 @@
  */
 bj_visitor bjm_visitor_noop(void *ctx);
 
+/*
+ * 1 when `data` is shaped like a headers envelope: a two-element array
+ * whose first element is an object. Only the shape — the headers
+ * themselves are the publisher's business.
+ */
+int bjm_envelope_shape_ok(const uint8_t *data, size_t len);
+
+/*
+ * Split [ headers, message ] into its two encoded parts, which point
+ * into `data`. Returns 0 if it is not that shape.
+ */
+int bjm_envelope_split(const uint8_t *data, size_t len,
+                       const uint8_t **headers, size_t *headers_len,
+                       const uint8_t **message, size_t *message_len);
+
 /* ---- subject store (server side) ------------------------------------- */
 
 /*
@@ -46,11 +61,25 @@ void bjm_store_free(bjm_store *st);
 int bjm_subject_valid(const char *s);
 
 /*
+ * Message shapes, carried in the entry log's own type byte — which is
+ * already in every subscribe response, so a subscriber can tell them
+ * apart without the broker unwrapping anything.
+ *
+ * A message with headers is stored as the two-element binjson ARRAY
+ * [ headers, message ]. That costs nothing for the headerless case,
+ * which stays byte-for-byte what the publisher sent, and it keeps the
+ * subscribe path forwarding elog_get_batch's output untouched. Headers
+ * are opaque to the broker: it validates the shape and nothing else.
+ */
+#define BJM_ENTRY_PLAIN    0x01   /* EL_NORMAL: payload is the message   */
+#define BJM_ENTRY_ENVELOPE 0x10   /* payload is [ headers, message ]     */
+
+/*
  * Append `payload` to `subject` and make it durable before returning —
  * one fsync per publish. Writes the assigned index through *out_index.
  * Returns BJ_OK or a negative BJ_ERR_* code.
  */
-int bjm_publish(bjm_store *st, const char *subject,
+int bjm_publish(bjm_store *st, const char *subject, int entry_type,
                 const uint8_t *payload, uint32_t len, uint64_t *out_index);
 
 /*
@@ -351,6 +380,8 @@ int bjm_cmd_work(int argc, char **argv);
 int bjm_cmd_dead(int argc, char **argv);
 int bjm_cmd_requeue(int argc, char **argv);
 int bjm_cmd_pipe(int argc, char **argv);
+int bjm_cmd_request(int argc, char **argv);
+int bjm_cmd_reply(int argc, char **argv);
 
 /* ---- rendering ------------------------------------------------------- */
 
