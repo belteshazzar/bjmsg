@@ -863,9 +863,18 @@ static void h_policies(http11c_request *req, http11c_response *res) {
 
 static void h_subjects(http11c_request *req, http11c_response *res) {
     app *a = http11c_req_ctx(req);
+
+    char pattern[BJM_SUBJECT_MAX + 1];
+    int has = http11c_req_query_get(req, "pattern", pattern, sizeof pattern);
+    if (has == 1 && !bjm_pattern_valid(pattern)) {
+        res_err(res, 400, "invalid pattern: '.'-separated tokens, '*' for one "
+                          "token, '>' for the rest (last only)\n");
+        return;
+    }
+
     const uint8_t *out = NULL;
     size_t out_len = 0;
-    int e = bjm_subjects(a->store, &out, &out_len);
+    int e = bjm_subjects(a->store, has == 1 ? pattern : NULL, &out, &out_len);
     if (e) { res_err(res, status_for(e), "listing failed\n"); return; }
     res_bj(res, 200, out, out_len);
 }
@@ -918,7 +927,7 @@ static void h_not_found(http11c_request *req, http11c_response *res) {
         "  GET    /consumers/<subject>\n"
         "  DELETE /consumers/<subject>?consumer=\n"
         "  GET    /info/<subject>\n"
-        "  GET    /subjects\n"
+        "  GET    /subjects[?pattern=]\n"
         "  GET    /health\n");
 }
 

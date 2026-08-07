@@ -79,7 +79,7 @@ bare `curl` against a broken request is readable.
 | `GET /consumers/<subject>` | | ARRAY of `{ consumer, acked, lag }` |
 | `DELETE /consumers/<subject>` | `?consumer=` | `{ subject, consumer, deleted }` |
 | `GET /info/<subject>` | | `{ subject, base, first, last, messages, bytes, consumers }` |
-| `GET /subjects` | | ARRAY of subject names |
+| `GET /subjects` | `?pattern=` | ARRAY of subject names |
 | `GET /health` | | `{ ok, backend, subjects, connections, uptime_s }` |
 
 Subscribe also answers `X-Bjmsg-Count` and `X-Bjmsg-Last-Index`, so a
@@ -288,6 +288,57 @@ is current survives a restart.
 
 An id is opaque to the broker: 1–128 printable bytes, no `/` (which
 separates subject from id in the index key).
+
+## Wildcard subscriptions
+
+Subjects match token-wise on `.` — no regular expressions:
+
+| pattern | matches | does not match |
+| --- | --- | --- |
+| `orders.*` | `orders.us`, `orders.eu` | `orders`, `orders.us.new` |
+| `orders.>` | `orders.us`, `orders.us.new` | `orders` |
+| `orders.*.new` | `orders.us.new` | `orders.new` |
+| `>` | everything | |
+
+`*` takes exactly one token, `>` takes that token and everything below
+it, and `>` is only legal last. Neither character is legal in a subject
+name, so a pattern can never be mistaken for one — nothing has to say
+which it is.
+
+```sh
+bjmsg sub 'orders.*' --follow
+orders.eu   1   "an order"
+orders.us   1   "another"
+
+bjmsg subjects 'orders.>'
+```
+
+Output gains a subject column, because **each matched subject keeps its
+own cursor**. That is the whole of the design: subjects have independent
+index spaces, so a wildcard subscription is N ordinary subscriptions
+discovered by pattern instead of by name. Durable ones need no new
+storage at all — receipts are already keyed `<subject>/<consumer>`, so
+`sub 'orders.*' --consumer w` is simply a receipt per match, and
+`bjmsg consumers orders.us` lists it like any other.
+
+Matching happens during **subject discovery**, not during the read: the
+client asks `GET /subjects?pattern=` and then polls each match with the
+machinery a single-subject subscription already uses. That costs one
+request per matched subject per poll instead of one overall — fine for
+tens of subjects on a kept-alive connection. If that ever bites, the fix
+is a merged server-side read, which would have to give up the
+verbatim-forwarding that makes single-subject `sub` free.
+
+Two things worth knowing:
+
+- **There is no order across subjects.** Each is delivered in its own
+  order and the interleaving means nothing — `orders.us` index 5 and
+  `orders.eu` index 5 are unrelated messages. If you need a total order
+  over a set, they have to be one subject.
+- **New subjects are picked up** as they are created, re-resolved every
+  few seconds. `--tail` applies only to what existed when the
+  subscription started; a subject created later is delivered from its
+  first message, since nothing in it predates the subscription.
 
 ## Read receipts: durable subscriptions
 

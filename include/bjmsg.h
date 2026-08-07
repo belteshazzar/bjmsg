@@ -61,6 +61,20 @@ void bjm_store_free(bjm_store *st);
 int bjm_subject_valid(const char *s);
 
 /*
+ * Subject patterns, matched token-wise on '.' — no regular expressions:
+ *
+ *   orders.*          one token here      → orders.us, not orders.us.new
+ *   orders.>          this and everything below → orders.us, orders.us.new
+ *   orders.*.created  mixed
+ *
+ * '*' and '>' are not legal in a subject name, so a pattern can never be
+ * mistaken for one and nothing has to flag which it is.
+ */
+int bjm_pattern_valid(const char *s);
+int bjm_pattern_is(const char *s);      /* 1 if it contains a wildcard */
+int bjm_pattern_match(const char *pattern, const char *subject);
+
+/*
  * Message shapes, carried in the entry log's own type byte — which is
  * already in every subscribe response, so a subscriber can tell them
  * apart without the broker unwrapping anything.
@@ -98,7 +112,8 @@ int bjm_read(bjm_store *st, const char *subject, uint64_t from,
  * directory so the answer includes subjects this process has never opened.
  * Bytes are owned by the store and valid until the next call.
  */
-int bjm_subjects(bjm_store *st, const uint8_t **out, size_t *out_len);
+int bjm_subjects(bjm_store *st, const char *pattern,
+                 const uint8_t **out, size_t *out_len);
 
 /* ---- durable subscriptions (read receipts) ---------------------------- */
 

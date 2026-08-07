@@ -110,6 +110,57 @@ static int name_valid(const char *s, size_t max) {
 }
 
 int bjm_subject_valid(const char *s)  { return name_valid(s, BJM_SUBJECT_MAX); }
+
+/* ---- subject patterns -------------------------------------------------- */
+
+/* Next '.'-separated token, or 0 when the string is exhausted. Subject
+ * validation rules out empty tokens, so none appear here. */
+static int next_token(const char **p, const char **tok, size_t *len) {
+    if (!**p) return 0;
+    const char *dot = strchr(*p, '.');
+    *tok = *p;
+    *len = dot ? (size_t)(dot - *p) : strlen(*p);
+    *p = dot ? dot + 1 : *p + *len;
+    return 1;
+}
+
+int bjm_pattern_is(const char *s) {
+    return s && (strchr(s, '*') != NULL || strchr(s, '>') != NULL);
+}
+
+int bjm_pattern_valid(const char *s) {
+    if (!s || !*s) return 0;
+    if (strlen(s) > BJM_SUBJECT_MAX) return 0;
+    const char *p = s, *tok;
+    size_t len;
+    while (next_token(&p, &tok, &len)) {
+        if (len == 0) return 0;
+        if (len == 1 && tok[0] == '>') return *p == '\0';   /* only last */
+        if (len == 1 && tok[0] == '*') continue;
+        for (size_t i = 0; i < len; i++) {
+            char c = tok[i];
+            int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                     (c >= '0' && c <= '9') || c == '_' || c == '-';
+            if (!ok) return 0;
+        }
+    }
+    return 1;
+}
+
+int bjm_pattern_match(const char *pattern, const char *subject) {
+    const char *p = pattern, *s = subject;
+    const char *pt, *st;
+    size_t pl, sl;
+    while (next_token(&p, &pt, &pl)) {
+        /* '>' takes this token and every one after it, so there has to
+         * be at least one left. */
+        if (pl == 1 && pt[0] == '>') return *s != '\0';
+        if (!next_token(&s, &st, &sl)) return 0;      /* subject too short */
+        if (pl == 1 && pt[0] == '*') continue;
+        if (pl != sl || memcmp(pt, st, pl) != 0) return 0;
+    }
+    return *s == '\0';                                /* subject too long */
+}
 int bjm_consumer_valid(const char *s) { return name_valid(s, BJM_CONSUMER_MAX); }
 
 /* Defined with the rest of the retention machinery, used on the publish
@@ -1718,6 +1769,9 @@ int bjm_subject_count(bjm_store *st, int *count) {
     *count = 0;
     DIR *d = fdopendir(dup(st->dirfd));
     if (!d) return BJ_ERR_STATE;
+    /* dup shares the file offset with st->dirfd, so a previous listing
+     * leaves the directory at EOF and this reads nothing. */
+    rewinddir(d);
     const size_t suffix_len = sizeof SUBJECT_SUFFIX - 1;
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
@@ -2010,7 +2064,8 @@ int bjm_policy_list(bjm_store *st, const uint8_t **out, size_t *out_len) {
 
 /* ---- discovery ------------------------------------------------------- */
 
-int bjm_subjects(bjm_store *st, const uint8_t **out, size_t *out_len) {
+int bjm_subjects(bjm_store *st, const char *pattern,
+                 const uint8_t **out, size_t *out_len) {
     DIR *d = fdopendir(dup(st->dirfd));
     if (!d) return BJ_ERR_STATE;
     rewinddir(d);
@@ -2025,6 +2080,14 @@ int bjm_subjects(bjm_store *st, const uint8_t **out, size_t *out_len) {
         size_t n = strlen(ent->d_name);
         if (n <= suffix_len) continue;
         if (strcmp(ent->d_name + n - suffix_len, SUBJECT_SUFFIX) != 0) continue;
+        if (pattern) {
+            char name[BJM_SUBJECT_MAX + 1];
+            size_t base = n - suffix_len;
+            if (base > BJM_SUBJECT_MAX) continue;
+            memcpy(name, ent->d_name, base);
+            name[base] = '\0';
+            if (!bjm_pattern_match(pattern, name)) continue;
+        }
         bj_put_string(b, (const uint8_t *)ent->d_name, (uint32_t)(n - suffix_len));
     }
     closedir(d);

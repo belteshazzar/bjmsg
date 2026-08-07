@@ -449,6 +449,7 @@ typedef struct {
     long long index;
     uint64_t next;     /* cursor to request next time */
     int      count;
+    const char *subject;   /* printed first when following a pattern */
 } sub_scan;
 
 static void s_key(void *ctx, const uint8_t *k, uint32_t len) {
@@ -466,6 +467,7 @@ static void s_int(void *ctx, double v) {
 static void s_binary(void *ctx, const uint8_t *bytes, uint32_t len) {
     sub_scan *s = ctx;
     if (strcmp(s->key, "payload") != 0) return;
+    if (s->subject) printf("%s\t", s->subject);
     printf("%lld\t", s->index);
     if (bjm_render(stdout, bytes, len) != BJ_OK) fputs("<undecodable>", stdout);
     fputc('\n', stdout);
@@ -476,10 +478,14 @@ static void s_binary(void *ctx, const uint8_t *bytes, uint32_t len) {
 
 static void sub_usage(void) {
     fprintf(stderr,
-        "usage: bjmsg sub [--url URL] <subject> [--consumer NAME]\n"
+        "usage: bjmsg sub [--url URL] <subject|pattern> [--consumer NAME]\n"
         "                 [--from N | --tail] [--follow] [--interval MS]\n"
         "                 [--retry MS] [--max BYTES]\n"
         "\n"
+        "  <pattern>     'orders.*' follows one token, 'orders.>' follows\n"
+        "                that and everything below. Each matched subject\n"
+        "                keeps its own cursor, and output gains a subject\n"
+        "                column. New matches are picked up as they appear.\n"
         "  --consumer N  durable subscription: the broker remembers how far\n"
         "                NAME has read, so rejoining delivers only what it\n"
         "                has not acknowledged. Overrides --from.\n"
@@ -493,6 +499,149 @@ static void sub_usage(void) {
         "                reached, so a subscription survives a broker\n"
         "                restart (default 5000; 0 disables retrying)\n");
 }
+
+/*
+ * One subject a subscription is following. A plain subject makes a list
+ * of one; a pattern makes one per match, each with its own cursor —
+ * which is the whole trick, since subjects have independent index
+ * spaces and there is no order across them.
+ */
+typedef struct {
+    char     subject[BJM_SUBJECT_MAX + 1];
+    uint64_t from;         /* ephemeral cursor */
+    uint64_t pending_ack;  /* durable: delivered but not yet acknowledged */
+    uint64_t acked;        /* the broker's receipt, from X-Bjmsg-Acked */
+    int      tail;         /* still owes its "where does this end" probe */
+} sub_target;
+
+#define POLL_OK    0
+#define POLL_ABSENT -1     /* 404: no such subject (yet) */
+#define POLL_FATAL -2
+
+/* Poll one subject once, printing whatever came back. Returns the number
+ * of messages, or POLL_ABSENT / POLL_FATAL. */
+static int poll_target(client *c, const char *url_base, sub_target *t,
+                       const char *consumer, uint64_t max_bytes,
+                       int show_subject) {
+    char url[1024];
+    if (consumer) {
+        int n = snprintf(url, sizeof url, "%s/sub/%s?consumer=%s&max=%llu",
+                         url_base, t->subject, consumer,
+                         (unsigned long long)max_bytes);
+        /* Piggyback the receipt for the previous batch: the broker
+         * persists it before choosing what to send next, so this costs
+         * no extra round trip. */
+        if (t->pending_ack && n > 0 && (size_t)n < sizeof url)
+            n += snprintf(url + n, sizeof url - n, "&ack=%llu",
+                          (unsigned long long)t->pending_ack);
+        if (t->tail && n > 0 && (size_t)n < sizeof url)
+            snprintf(url + n, sizeof url - n, "&start=last");
+    } else {
+        snprintf(url, sizeof url, "%s/sub/%s?from=%llu&max=%llu",
+                 url_base, t->subject, (unsigned long long)t->from,
+                 (unsigned long long)max_bytes);
+    }
+
+    long status = client_perform(c, url);
+    if (g_stop) return POLL_FATAL;
+    if (status < 0) return POLL_FATAL;
+    if (status == 404) {
+        /* Absent is not an error: with --tail there is no backlog to
+         * skip, so the first message published is the first one wanted. */
+        if (t->tail) { t->tail = 0; t->from = 1; }
+        return POLL_ABSENT;
+    }
+    if (status != 200) {
+        report_error(c, status);
+        return POLL_FATAL;
+    }
+
+    if (c->skipped) {
+        fprintf(stderr, "bjmsg: %s: %llu message(s) had already been "
+                        "trimmed; starting at the oldest one kept\n",
+                t->subject, (unsigned long long)c->skipped);
+        c->skipped = 0;
+    }
+
+    sub_scan s = {0};
+    s.next = t->from;
+    s.subject = show_subject ? t->subject : NULL;
+    bj_visitor v = bjm_visitor_noop(&s);
+    v.on_int = s_int;
+    v.on_binary = s_binary;
+    v.on_key = s_key;
+    if (bj_decode(c->body.p, c->body.len, &v, NULL) != BJ_OK) {
+        fprintf(stderr, "bjmsg: malformed batch from broker\n");
+        return POLL_FATAL;
+    }
+
+    if (t->tail && !consumer) {
+        /* The probe told us where the log ends; start just past it. */
+        t->from = c->last_index + 1;
+        t->tail = 0;
+        return 0;
+    }
+    t->tail = 0;
+    if (s.count > 0) t->pending_ack = s.next - 1;
+    t->acked = c->acked;
+    t->from = s.next;
+    return s.count;
+}
+
+/* Collect the strings of a binjson ARRAY. */
+typedef struct { sub_target **list; int *n, *cap; uint64_t from; int tail; } resolver;
+
+static void rv_string(void *ctx, const uint8_t *v, uint32_t len) {
+    resolver *r = ctx;
+    if (len > BJM_SUBJECT_MAX) return;
+    char name[BJM_SUBJECT_MAX + 1];
+    memcpy(name, v, len);
+    name[len] = '\0';
+
+    for (int i = 0; i < *r->n; i++)
+        if (strcmp((*r->list)[i].subject, name) == 0) return;   /* known */
+
+    if (*r->n == *r->cap) {
+        int cap = *r->cap ? *r->cap * 2 : 8;
+        sub_target *p = realloc(*r->list, (size_t)cap * sizeof *p);
+        if (!p) return;
+        *r->list = p;
+        *r->cap = cap;
+    }
+    sub_target *t = &(*r->list)[(*r->n)++];
+    memset(t, 0, sizeof *t);
+    snprintf(t->subject, sizeof t->subject, "%s", name);
+    t->from = r->from;
+    t->tail = r->tail;
+}
+
+/*
+ * Add any newly matching subjects to the list, keeping the cursors of
+ * those already there. Subjects are created at any time, so a pattern
+ * has to be re-asked periodically rather than resolved once.
+ */
+static int resolve_pattern(client *c, const char *url_base, const char *pattern,
+                           sub_target **list, int *n, int *cap,
+                           uint64_t from, int tail) {
+    char *esc = curl_easy_escape(c->curl, pattern, 0);
+    if (!esc) return -1;
+    char url[1024];
+    snprintf(url, sizeof url, "%s/subjects?pattern=%s", url_base, esc);
+    curl_free(esc);
+
+    curl_easy_setopt(c->curl, CURLOPT_HTTPGET, 1L);
+    curl_easy_setopt(c->curl, CURLOPT_CUSTOMREQUEST, NULL);
+    long status = client_perform(c, url);
+    if (status != 200) return -1;
+
+    resolver r = { list, n, cap, from, tail };
+    bj_visitor v = bjm_visitor_noop(&r);
+    v.on_string = rv_string;
+    return bj_decode(c->body.p, c->body.len, &v, NULL) == BJ_OK ? 0 : -1;
+}
+
+/* How often a pattern is re-asked for newly created subjects. */
+#define RESOLVE_EVERY_MS 3000
 
 int bjm_cmd_sub(int argc, char **argv) {
     const char *url_base = DEFAULT_URL;
@@ -547,8 +696,10 @@ int bjm_cmd_sub(int argc, char **argv) {
     }
 
     if (!subject) { sub_usage(); return 2; }
-    if (!bjm_subject_valid(subject)) {
-        fprintf(stderr, "bjmsg: invalid subject '%s'\n", subject);
+    int is_pattern = bjm_pattern_is(subject);
+    if (is_pattern ? !bjm_pattern_valid(subject) : !bjm_subject_valid(subject)) {
+        fprintf(stderr, "bjmsg: invalid %s '%s'\n",
+                is_pattern ? "pattern" : "subject", subject);
         return 2;
     }
     if (consumer && !bjm_consumer_valid(consumer)) {
@@ -558,125 +709,113 @@ int bjm_cmd_sub(int argc, char **argv) {
     if (from == 0) from = 1;
     /*
      * --tail asks a cursor past the end of the log, which the broker
-     * answers with an empty batch plus the real last index. So the first
-     * request costs nothing, delivers nothing, and tells us where to
-     * start — no extra route needed.
-     *
+     * answers with an empty batch plus the real last index — so the
+     * probe costs nothing, delivers nothing, and says where to start.
      * With --consumer the broker owns the cursor, so --tail becomes
-     * ?start=last: it only decides where a consumer being seen for the
-     * first time joins, and is ignored once it has a receipt.
+     * ?start=last and only decides where a new consumer joins.
      */
-    if (tail && !consumer) from = UINT64_MAX;
+    uint64_t start_from = (tail && !consumer) ? UINT64_MAX : from;
 
     client c;
     if (client_init(&c, retry_ms) != 0) return 1;
     curl_easy_setopt(c.curl, CURLOPT_HTTPGET, 1L);
 
-    /* Highest index handed to the user but not yet acknowledged. */
-    uint64_t pending_ack = 0;
+    sub_target *targets = NULL;
+    int ntargets = 0, cap = 0;
+    if (!is_pattern) {
+        targets = calloc(1, sizeof *targets);
+        if (!targets) { client_free(&c); return 1; }
+        snprintf(targets[0].subject, sizeof targets[0].subject, "%s", subject);
+        targets[0].from = start_from;
+        targets[0].tail = tail;
+        ntargets = cap = 1;
+    }
 
     int rc = 0;
+    int first_resolve = 1;
+    long since_resolve = RESOLVE_EVERY_MS;   /* resolve on the first pass */
     while (!g_stop) {
-        char url[1024];
-        if (consumer) {
-            int n = snprintf(url, sizeof url,
-                             "%s/sub/%s?consumer=%s&max=%llu",
-                             url_base, subject, consumer,
-                             (unsigned long long)max_bytes);
-            /* Piggyback the receipt for the previous batch: the broker
-             * persists it before choosing what to send next, so this
-             * costs no extra round trip. */
-            if (pending_ack && n > 0 && (size_t)n < sizeof url)
-                n += snprintf(url + n, sizeof url - n, "&ack=%llu",
-                              (unsigned long long)pending_ack);
-            if (tail && n > 0 && (size_t)n < sizeof url)
-                snprintf(url + n, sizeof url - n, "&start=last");
-        } else {
-            snprintf(url, sizeof url, "%s/sub/%s?from=%llu&max=%llu",
-                     url_base, subject, (unsigned long long)from,
-                     (unsigned long long)max_bytes);
-        }
-
-        long status = client_perform(&c, url);
-        if (g_stop) break;
-        if (status < 0) { rc = 1; break; }
-        if (status != 200) {
-            /* A subject that does not exist yet is not an error when
-             * following — the publisher may simply not have run. Nor when
-             * tailing an absent subject: it has no backlog to skip, so
-             * the first message published is the first one we want. */
-            if (status == 404 && (follow || tail)) {
-                if (tail) { tail = 0; from = 1; }
-                if (!follow) { rc = 0; break; }
+        if (is_pattern && since_resolve >= RESOLVE_EVERY_MS) {
+            since_resolve = 0;
+            /*
+             * Only the first resolve honours --tail. A subject that
+             * appears later did not exist when the subscription started,
+             * so it has no backlog to skip — everything in it is new,
+             * and starting at its end would silently drop whatever was
+             * published between its creation and this resolve.
+             */
+            if (resolve_pattern(&c, url_base, subject, &targets,
+                                &ntargets, &cap,
+                                first_resolve ? start_from : 1,
+                                first_resolve ? tail : 0) != 0) {
+                rc = 1;
+                break;
+            }
+            /* Nothing matched yet, so nothing has been skipped: the
+             * next resolve is still the subscription starting. */
+            if (ntargets > 0) first_resolve = 0;
+            if (ntargets == 0) {
+                if (!follow) break;
                 sleep_ms(interval);
+                since_resolve += interval;
                 continue;
             }
-            report_error(&c, status);
+        }
+
+        int delivered = 0, absent = 0, fatal = 0;
+        for (int i = 0; i < ntargets && !g_stop; i++) {
+            int n = poll_target(&c, url_base, &targets[i], consumer,
+                                max_bytes, is_pattern);
+            if (n == POLL_FATAL) { fatal = 1; break; }
+            if (n == POLL_ABSENT) { absent++; continue; }
+            delivered += n;
+        }
+        if (fatal) { rc = g_stop ? rc : 1; break; }
+
+        /* A named subject that does not exist is an error unless we are
+         * waiting for it; under a pattern it just means "not yet". */
+        if (!is_pattern && absent == ntargets && !follow && !tail) {
+            report_error(&c, 404);
             rc = 1;
             break;
         }
 
-        if (c.skipped) {
-            fprintf(stderr, "bjmsg: %llu message(s) had already been trimmed; "
-                            "starting at the oldest one kept\n",
-                    (unsigned long long)c.skipped);
-            c.skipped = 0;
-        }
-
-        sub_scan s = {0};
-        s.next = from;
-        bj_visitor v = bjm_visitor_noop(&s);
-        v.on_int = s_int;
-        v.on_binary = s_binary;
-        v.on_key = s_key;
-        if (bj_decode(c.body.p, c.body.len, &v, NULL) != BJ_OK) {
-            fprintf(stderr, "bjmsg: malformed batch from server\n");
-            rc = 1;
-            break;
-        }
-        if (tail && !consumer) {
-            /* The probe told us where the log ends; start just past it. */
-            from = c.last_index + 1;
-            tail = 0;
-            continue;
-        }
-        if (s.count > 0) pending_ack = s.next - 1;
-        from = s.next;
-
-        if (s.count == 0) {
-            if (!follow) break;      /* caught up */
+        if (delivered == 0) {
+            if (!follow) break;          /* caught up everywhere */
             sleep_ms(interval);
+            since_resolve += interval;
         }
     }
 
     /*
-     * The receipt for the last batch has nowhere to piggyback once the
-     * loop ends, so send it explicitly — unless a later poll already
-     * carried it, which X-Bjmsg-Acked tells us for free.
+     * The receipt for each subject's last batch has nowhere to piggyback
+     * once the loop ends, so send it explicitly — unless a later poll
+     * already carried it, which X-Bjmsg-Acked tells us for free. One
+     * attempt each regardless of --retry: hanging on the way out is
+     * worse than a redelivery that at-least-once already permits.
      */
-    if (consumer && pending_ack > c.acked && rc == 0) {
-        char url[1024];
-        snprintf(url, sizeof url, "%s/ack/%s?consumer=%s&index=%llu",
-                 url_base, subject, consumer, (unsigned long long)pending_ack);
-        curl_easy_setopt(c.curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, "");
-        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, 0L);
-        /*
-         * We are here *because* of the Ctrl-C, so clear the stop flag or
-         * the request would refuse to run — and take one attempt only,
-         * since hanging on the way out is worse than a redelivery that
-         * at-least-once already permits. A second Ctrl-C still lands.
-         */
+    if (consumer && rc == 0) {
         g_stop = 0;
         c.retry_ms = 0;
-        c.waiting = 0;
-        long status = client_perform(&c, url);
-        if (status != 200)
-            fprintf(stderr, "bjmsg: final ack of index %llu failed"
-                            " (that batch will be redelivered)\n",
-                    (unsigned long long)pending_ack);
+        for (int i = 0; i < ntargets; i++) {
+            sub_target *t = &targets[i];
+            if (t->pending_ack <= t->acked) continue;
+            char url[1024];
+            snprintf(url, sizeof url, "%s/ack/%s?consumer=%s&index=%llu",
+                     url_base, t->subject, consumer,
+                     (unsigned long long)t->pending_ack);
+            curl_easy_setopt(c.curl, CURLOPT_POST, 1L);
+            curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, "");
+            curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, 0L);
+            c.waiting = 0;
+            if (client_perform(&c, url) != 200)
+                fprintf(stderr, "bjmsg: final ack of %s index %llu failed"
+                                " (that batch will be redelivered)\n",
+                        t->subject, (unsigned long long)t->pending_ack);
+        }
     }
 
+    free(targets);
     client_free(&c);
     return rc;
 }
@@ -2167,15 +2306,33 @@ int bjm_cmd_seek(int argc, char **argv) {
     return query_run(&o, "POST", url);
 }
 
-#define SUBJECTS_USAGE "usage: bjmsg subjects [--url URL] [--retry MS]\n"
+#define SUBJECTS_USAGE \
+    "usage: bjmsg subjects [--url URL] [--retry MS] [<pattern>]\n" \
+    "\n" \
+    "With no pattern, every subject. A pattern matches token-wise on '.':\n" \
+    "'*' is one token, '>' is this one and everything below it.\n"
 
 int bjm_cmd_subjects(int argc, char **argv) {
     query_opts o;
     int rc = query_parse(argc, argv, &o, SUBJECTS_USAGE);
     if (rc) return rc == 1 ? 0 : rc;
+    if (o.subject && !bjm_pattern_valid(o.subject)) {
+        fputs(SUBJECTS_USAGE, stderr);
+        return 2;
+    }
 
     char url[1024];
-    snprintf(url, sizeof url, "%s/subjects", o.url_base);
+    if (o.subject) {
+        client tmp;
+        if (client_init(&tmp, o.retry_ms) != 0) return 1;
+        char *esc = curl_easy_escape(tmp.curl, o.subject, 0);
+        snprintf(url, sizeof url, "%s/subjects?pattern=%s",
+                 o.url_base, esc ? esc : o.subject);
+        if (esc) curl_free(esc);
+        client_free(&tmp);
+    } else {
+        snprintf(url, sizeof url, "%s/subjects", o.url_base);
+    }
     return query_run(&o, NULL, url);
 }
 
