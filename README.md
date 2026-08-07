@@ -65,10 +65,10 @@ bare `curl` against a broken request is readable.
 | route | body / query | response |
 | --- | --- | --- |
 | `POST /pub/<subject>` | one binjson value, `?id=&ack_subject=&ack_consumer=&ack_index=` | `{ subject, index, acked, duplicate }` |
-| `PUT /push/<subject\|pattern>` | `?consumer=&callback=[&token=&batch=&start=last\|&from=]` | `{ consumer, pattern, callback, created }` |
+| `PUT /push/<subject\|pattern>` | `?consumer=&callback=[&group=&max=&token=&batch=&start=last\|&from=]` | `{ consumer, pattern, callback, group, created }` |
 | `DELETE /push` | `?consumer=[&purge=1]` | `{ consumer, deleted, purged }` |
 | `GET /push` | | ARRAY of `{ consumer, pattern, callback, delivered, inflight, failures, error }` |
-| `POST <callback>` | ARRAY of `{ index, term, type, payload }`, plus `X-Bjmsg-*` | `2xx` acks; `X-Bjmsg-Ack: N` acks part |
+| `POST <callback>` | a batch, plus `X-Bjmsg-*` | `2xx` acks; `X-Bjmsg-Ack: N` acks part; `X-Bjmsg-Done:` for jobs |
 | `GET /sub/<subject>` | `?from=&max=` | ARRAY of `{ index, term, type, payload }` |
 | `GET /sub/<subject>` | `?consumer=&ack=&start=` | same, from the consumer's receipt |
 | `POST /ack/<subject>` | `?consumer=&index=` | `{ subject, consumer, acked }` |
@@ -511,14 +511,45 @@ exactly one member of the group instead of to all of them.
 ```sh
 bjmsg work jobs --group workers --exec ./handle-job   # run one per job
 bjmsg queue jobs                                      # what the groups are doing
+bjmsg push                                            # which workers are registered
 ```
 
-`work` takes one job at a time, writes the payload to the command's stdin
-with `BJMSG_SUBJECT` / `BJMSG_GROUP` / `BJMSG_INDEX` / `BJMSG_ATTEMPTS` in
-its environment, and finishes the job if the command exits 0 or returns it
-to the queue otherwise. Run as many as you like; they compete. The
-primitives underneath are `take`, `done` and `fail` if you would rather
-drive it yourself.
+`work` writes each job's payload to the command's stdin with
+`BJMSG_SUBJECT` / `BJMSG_GROUP` / `BJMSG_INDEX` / `BJMSG_ATTEMPTS` in its
+environment, and finishes the job if the command exits 0 or returns it to
+the queue otherwise. Run as many as you like; they compete. The primitives
+underneath are `take`, `done` and `fail` if you would rather drive it
+yourself.
+
+Jobs are **pushed too**: `work` is the same receiver `sub` is, registered
+with a `group`. The broker leases the jobs and POSTs them; the reply
+settles them. So a worker never asks whether there is anything to do — an
+idle queue costs nothing, and a job published now is running now.
+
+The reply is not simply a status, because jobs finish out of order and a
+high-water mark cannot say which ones did. One job per delivery is the
+default, which makes it unambiguous — `2xx` finished it, anything else
+returned it — and is also what spreads a queue evenly across workers.
+`--max N` trades that for fewer round trips, and then `X-Bjmsg-Done`
+names the ones that succeeded; the broker fails whatever the list omits.
+
+Two things follow from the broker doing the leasing:
+
+- **A transport failure settles nothing.** If the worker never got the
+  jobs, or never answered about them, the broker deliberately does not
+  `fail` them — it leaves them to their leases, which is exactly the case
+  a lease exists for. Only an HTTP error is a real attempt, because only
+  then did a worker actually look at the job.
+- **An idle worker waits on the lease clock, not on a timer.** When a take
+  finds nothing, the broker asks the group when its earliest outstanding
+  lease lapses and sleeps until then. If nothing is outstanding, only a
+  publish can wake it. Re-asking a queue on an interval would have been
+  polling in a different coat.
+
+`work` has no `--keep`: a worker left registered after it exits would have
+jobs leased to a callback that is not there, and each would sit out its
+lease before anyone else could have it. A subscriber left registered only
+accumulates a backlog; a worker left registered holds jobs hostage.
 
 ### Why a receipt could not do this
 
@@ -731,10 +762,10 @@ What a reader sees after a trim depends on which kind of cursor it holds:
   expose its readiness fd for libcurl's sockets to be waited on alongside.
   It costs nothing when idle and nothing measurable in flight, but a
   `http11c_pollfd()` upstream would remove it.
-- **Queue-group workers still poll.** `bjmsg work`, `bjmsg reply` and
-  `bjmsg pipe` drive `POST /take` on an interval. The delivery engine
-  generalises to them — a leased job POSTed to a callback, `2xx` meaning
-  done and anything else meaning fail — and that is the next piece.
+- **`bjmsg reply` and `bjmsg pipe` still poll.** Both drive `GET /sub` or
+  `POST /take` on an interval. They are the same shape as `sub` and
+  `work` with a publish on the end, so the receiver machinery covers
+  them; they are simply not converted yet.
 - **A queue group's in-flight table is capped** at 256 jobs. Past that a
   `take` returns nothing until acks come in, which is backpressure rather
   than an error — but it does bound how many jobs one group can have

@@ -29,7 +29,7 @@ static void usage(void) {
         "                    [--port N] [--callback URL] [--exec CMD] [--keep]\n"
         "\n"
         "job queues (each message goes to one group member):\n"
-        "  bjmsg work        [--url URL] <subject> --group G --exec CMD\n"
+        "  bjmsg work        [--url URL] <subject> --group G --exec CMD [--max N]\n"
         "  bjmsg take        [--url URL] <subject> --group G [--max N]\n"
         "  bjmsg done        [--url URL] <subject> --group G --index N\n"
         "  bjmsg fail        [--url URL] <subject> --group G --index N\n"

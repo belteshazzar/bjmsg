@@ -111,6 +111,19 @@ static int query_consumer(http11c_request *req, http11c_response *res,
     return 1;
 }
 
+/* As query_consumer, for the `group` parameter. */
+static int query_group(http11c_request *req, http11c_response *res,
+                       char *out, size_t out_size) {
+    int rc = http11c_req_query_get(req, "group", out, out_size);
+    if (rc == 0) return 0;
+    if (rc != 1 || !bjm_group_valid(out)) {
+        res_err(res, 400, "invalid group: expected 1-128 chars of "
+                          "[A-Za-z0-9_.-], no leading/trailing dot\n");
+        return -1;
+    }
+    return 1;
+}
+
 /* ---- handlers -------------------------------------------------------- */
 
 static void h_publish(http11c_request *req, http11c_response *res) {
@@ -478,6 +491,17 @@ static void h_push_put(http11c_request *req, http11c_response *res) {
     cfg.batch_bytes = query_u64(req, "batch", 0);
 
     /*
+     * With ?group=, this registers a pushed *worker* rather than a
+     * subscriber: the broker leases jobs from the queue group instead of
+     * reading from a receipt, and the response settles them. Everything
+     * else — the callback, the token, the retries — is the same.
+     */
+    int has_group = query_group(req, res, cfg.group, sizeof cfg.group);
+    if (has_group < 0) return;
+    cfg.max_jobs = query_u64(req, "max", 0);
+    if (cfg.max_jobs > BJM_PUSH_JOBS_MAX) cfg.max_jobs = BJM_PUSH_JOBS_MAX;
+
+    /*
      * A brand-new subscription gets its receipts written now, before the
      * first delivery, so where it starts is settled once. An existing one
      * keeps its place: re-registering is how a subscriber that restarted
@@ -489,7 +513,10 @@ static void h_push_put(http11c_request *req, http11c_response *res) {
     int e = bjm_push_get(a->store, consumer, &found, &existing);
     if (e) { res_err(res, status_for(e), "lookup failed\n"); return; }
 
-    if (!found) {
+    /* A queue group has no receipt to seed: where a worker starts is
+     * wherever the group's own cursor already is, shared with every other
+     * member. */
+    if (!found && !has_group) {
         char start[8];
         int at_end = http11c_req_query_get(req, "start", start,
                                            sizeof start) == 1 &&
@@ -516,6 +543,8 @@ static void h_push_put(http11c_request *req, http11c_response *res) {
     bj_put_key(b, (const uint8_t *)"callback", 8);
     bj_put_string(b, (const uint8_t *)cfg.callback,
                   (uint32_t)strlen(cfg.callback));
+    bj_put_key(b, (const uint8_t *)"group", 5);
+    bj_put_string(b, (const uint8_t *)cfg.group, (uint32_t)strlen(cfg.group));
     /* False means the subscription was already here and kept its place. */
     bj_put_key(b, (const uint8_t *)"created", 7);
     bj_put_bool(b, !found);
@@ -710,19 +739,6 @@ static void h_trim(http11c_request *req, http11c_response *res) {
     const uint8_t *out = bj_builder_data(b, &out_len);
     if (!out) { res_err(res, 500, "encode failed\n"); return; }
     res_bj(res, 200, out, out_len);
-}
-
-/* As query_consumer, for the `group` parameter. */
-static int query_group(http11c_request *req, http11c_response *res,
-                       char *out, size_t out_size) {
-    int rc = http11c_req_query_get(req, "group", out, out_size);
-    if (rc == 0) return 0;
-    if (rc != 1 || !bjm_group_valid(out)) {
-        res_err(res, 400, "invalid group: expected 1-128 chars of "
-                          "[A-Za-z0-9_.-], no leading/trailing dot\n");
-        return -1;
-    }
-    return 1;
 }
 
 /* Every queue route needs a valid subject and group; answers the request
@@ -1087,7 +1103,7 @@ static void h_not_found(http11c_request *req, http11c_response *res) {
     res_err(res, 404,
         "no such route. available:\n"
         "  POST   /pub/<subject>[?id=][&headers=1][&ack_subject=&ack_consumer=&ack_index=]\n"
-        "  PUT    /push/<subject|pattern>?consumer=&callback=[&token=&batch=&start=last|&from=]\n"
+        "  PUT    /push/<subject|pattern>?consumer=&callback=[&group=&max=&token=&batch=&start=last|&from=]\n"
         "  DELETE /push?consumer=\n"
         "  GET    /push\n"
         "  GET    /sub/<subject>?from=|consumer=\n"

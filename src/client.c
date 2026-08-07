@@ -725,10 +725,16 @@ static void host_for_url(const char *ip, char *out, size_t cap) {
  * which is what lets a subscriber that restarted on a new port simply say
  * so, and what makes the heartbeat below safe to send at any time.
  */
-static long push_register(client *c, const char *url_base, const char *pattern,
-                          const char *consumer, const char *callback,
-                          const char *token, uint64_t batch,
-                          int tail, uint64_t from) {
+typedef struct receiver_spec receiver_spec;
+
+static long push_register(client *c, const receiver_spec *sp,
+                          const char *callback);
+
+static long push_register_at(client *c, const char *url_base,
+                             const char *pattern, const char *consumer,
+                             const char *group, const char *callback,
+                             const char *token, uint64_t batch,
+                             uint64_t max_jobs, int tail, uint64_t from) {
     char *esc_cb = curl_easy_escape(c->curl, callback, 0);
     if (!esc_cb) return -1;
 
@@ -738,6 +744,11 @@ static long push_register(client *c, const char *url_base, const char *pattern,
     curl_free(esc_cb);
     if (n < 0 || (size_t)n >= sizeof url) return -1;
 
+    if (group && *group)
+        n += snprintf(url + n, sizeof url - n, "&group=%s", group);
+    if (max_jobs)
+        n += snprintf(url + n, sizeof url - n, "&max=%llu",
+                      (unsigned long long)max_jobs);
     if (token && *token)
         n += snprintf(url + n, sizeof url - n, "&token=%s", token);
     if (batch)
@@ -781,6 +792,163 @@ static long push_unregister(client *c, const char *url_base,
  */
 #define DEFAULT_HEARTBEAT_MS 30000
 #define RECEIVER_IDLE_TIMEOUT_SECS 300
+
+/*
+ * Everything `sub` and `work` share. They differ only in what they do
+ * with a delivery, which is `handler` — the rest, finding an address the
+ * broker can reach, listening on it, registering, staying registered and
+ * unregistering on the way out, is one job done once.
+ */
+struct receiver_spec {
+    const char *url_base;
+    const char *pattern;        /* subject or wildcard pattern */
+    const char *consumer;
+    const char *group;          /* NULL for a plain subscription */
+    const char *bind_addr;
+    const char *callback;
+    const char *token;
+    const char *path;           /* what we serve the callback on */
+    uint64_t    batch, max_jobs, from;
+    long        retry_ms, heartbeat_ms;
+    int         port, tail, keep, ephemeral;
+    http11c_handler handler;
+    void       *ctx;
+};
+
+static long push_register(client *c, const receiver_spec *sp,
+                          const char *callback) {
+    return push_register_at(c, sp->url_base, sp->pattern, sp->consumer,
+                            sp->group, callback, sp->token, sp->batch,
+                            sp->max_jobs, sp->tail, sp->from);
+}
+
+static int receiver_run(receiver_spec *sp) {
+    client c;
+    if (client_init(&c, sp->retry_ms) != 0) return 1;
+
+    /* Find out where we are before deciding where to listen. */
+    char local_ip[64] = "127.0.0.1";
+    if (!sp->bind_addr || !sp->callback) {
+        if (probe_local_ip(&c, sp->url_base, local_ip, sizeof local_ip) != 0) {
+            if (g_stop) { client_free(&c); return 0; }
+            fprintf(stderr, "bjmsg: cannot reach the broker at %s\n",
+                    sp->url_base);
+            client_free(&c);
+            return 1;
+        }
+    }
+    const char *bind_addr = sp->bind_addr ? sp->bind_addr : local_ip;
+
+    http11c_server *srv = http11c_server_new();
+    if (!srv) { client_free(&c); return 1; }
+    http11c_set_ctx(srv, sp->ctx);
+    http11c_set_max_body(srv, 8u * 1024 * 1024);
+    /*
+     * The broker holds one connection here and uses it whenever there is
+     * something to send, which on a quiet subject may be a long time. An
+     * idle timeout shorter than that would close a connection that is
+     * working exactly as intended.
+     */
+    http11c_set_idle_timeout(srv, RECEIVER_IDLE_TIMEOUT_SECS);
+    http11c_route(srv, "POST", sp->path, sp->handler);
+
+    if (http11c_listen(srv, bind_addr, sp->port) != 0) {
+        fprintf(stderr, "bjmsg: cannot listen on %s:%d\n",
+                bind_addr, sp->port);
+        http11c_server_free(srv);
+        client_free(&c);
+        return 1;
+    }
+    int port = http11c_port(srv);
+
+    char self[BJM_CALLBACK_MAX + 1];
+    if (sp->callback) {
+        snprintf(self, sizeof self, "%s", sp->callback);
+    } else {
+        char host[80];
+        host_for_url(local_ip, host, sizeof host);
+        snprintf(self, sizeof self, "http://%s:%d%s", host, port, sp->path);
+    }
+
+    long status = push_register(&c, sp, self);
+    if (status != 200) {
+        if (status > 0) report_error(&c, status);
+        http11c_server_free(srv);
+        client_free(&c);
+        return g_stop ? 0 : 1;
+    }
+
+    if (sp->group)
+        fprintf(stderr, "bjmsg: working %s group '%s' as '%s' on %s\n",
+                sp->pattern, sp->group, sp->consumer, self);
+    else
+        fprintf(stderr, "bjmsg: receiving %s as '%s' on %s\n",
+                sp->pattern, sp->consumer, self);
+
+    int rc = 0;
+    long since_beat = 0;
+    while (!g_stop) {
+        if (http11c_poll(srv, 1000) < 0) { rc = 1; break; }
+        if (sp->heartbeat_ms <= 0) continue;
+
+        since_beat += 1000;
+        if (since_beat < sp->heartbeat_ms) continue;
+        since_beat = 0;
+
+        /*
+         * Re-assert the subscription. It normally changes nothing, and
+         * that is the point: the one case it matters is a broker that no
+         * longer has us, which silence is indistinguishable from.
+         */
+        c.waiting = 0;
+        if (push_register(&c, sp, self) != 200 && !g_stop)
+            fprintf(stderr, "bjmsg: could not re-register the subscription\n");
+    }
+
+    /*
+     * Stop the deliveries before this process is not there to take them.
+     * One attempt, retries off: hanging on the way out is worse than a
+     * subscription the broker retires when its callback stops answering.
+     * The receipt survives either way — unregistering says "not here",
+     * not "forget where I was".
+     */
+    if (!sp->keep) {
+        g_stop = 0;
+        c.retry_ms = 0;
+        c.waiting = 0;
+        if (push_unregister(&c, sp->url_base, sp->consumer,
+                            sp->ephemeral) != 200)
+            fprintf(stderr, "bjmsg: could not unregister '%s'; the broker "
+                            "will keep trying to deliver to %s until it is "
+                            "removed (bjmsg push --consumer %s --delete)\n",
+                    sp->consumer, self, sp->consumer);
+    }
+
+    http11c_server_free(srv);
+    client_free(&c);
+    return rc;
+}
+
+/*
+ * A name and a token nobody has to choose. The token matters even for a
+ * throwaway subscription: without one, anything that can reach this port
+ * can have its messages printed as though the broker had sent them.
+ */
+static int receiver_identity(const char **consumer, char *gen, size_t gen_cap,
+                             const char *prefix,
+                             const char **token, char *tok, size_t tok_cap) {
+    if (!*consumer) {
+        char hex[17];
+        if (random_hex(hex, 8) != 0) return -1;
+        snprintf(gen, gen_cap, "%s-%s", prefix, hex);
+        *consumer = gen;
+    }
+    if (!*token) {
+        if (random_hex(tok, tok_cap >= 33 ? 16 : 8) != 0) return -1;
+        *token = tok;
+    }
+    return 0;
+}
 
 int bjm_cmd_sub(int argc, char **argv) {
     const char *url_base = DEFAULT_URL;
@@ -893,43 +1061,13 @@ int bjm_cmd_sub(int argc, char **argv) {
      * else will use, removed on the way out. With one it is durable, and
      * the broker keeps queueing while this process is not running.
      */
-    char generated[BJM_CONSUMER_MAX + 1];
+    char generated[BJM_CONSUMER_MAX + 1], auto_token[65];
     int ephemeral = (consumer == NULL);
-    if (ephemeral) {
-        char hex[17];
-        if (random_hex(hex, 8) != 0) {
-            fprintf(stderr, "bjmsg: cannot read /dev/urandom\n");
-            return 1;
-        }
-        snprintf(generated, sizeof generated, "sub-%s", hex);
-        consumer = generated;
+    if (receiver_identity(&consumer, generated, sizeof generated, "sub",
+                          &token, auto_token, sizeof auto_token) != 0) {
+        fprintf(stderr, "bjmsg: cannot read /dev/urandom\n");
+        return 1;
     }
-
-    /* A token by default, so a stray POST at this port is refused rather
-     * than printed as if the broker had sent it. */
-    char auto_token[65];
-    if (!token) {
-        if (random_hex(auto_token, 16) != 0) {
-            fprintf(stderr, "bjmsg: cannot read /dev/urandom\n");
-            return 1;
-        }
-        token = auto_token;
-    }
-
-    client c;
-    if (client_init(&c, retry_ms) != 0) return 1;
-
-    /* Find out where we are before deciding where to listen. */
-    char local_ip[64] = "127.0.0.1";
-    if (!bind_addr || !callback) {
-        if (probe_local_ip(&c, url_base, local_ip, sizeof local_ip) != 0) {
-            if (g_stop) { client_free(&c); return 0; }
-            fprintf(stderr, "bjmsg: cannot reach the broker at %s\n", url_base);
-            client_free(&c);
-            return 1;
-        }
-    }
-    if (!bind_addr) bind_addr = local_ip;
 
     receiver r;
     memset(&r, 0, sizeof r);
@@ -938,89 +1076,26 @@ int bjm_cmd_sub(int argc, char **argv) {
     r.exec = exec_cmd;
     r.show_subject = is_pattern;
 
-    http11c_server *srv = http11c_server_new();
-    if (!srv) { client_free(&c); return 1; }
-    http11c_set_ctx(srv, &r);
-    http11c_set_max_body(srv, 8u * 1024 * 1024);
-    /*
-     * The broker holds one connection here and uses it whenever there is
-     * something to send, which on a quiet subject may be a long time. An
-     * idle timeout shorter than that would close a connection that is
-     * working exactly as intended.
-     */
-    http11c_set_idle_timeout(srv, RECEIVER_IDLE_TIMEOUT_SECS);
-    http11c_route(srv, "POST", r.path, h_deliver);
-
-    if (http11c_listen(srv, bind_addr, port) != 0) {
-        fprintf(stderr, "bjmsg: cannot listen on %s:%d\n", bind_addr, port);
-        http11c_server_free(srv);
-        client_free(&c);
-        return 1;
-    }
-    port = http11c_port(srv);
-
-    char self[BJM_CALLBACK_MAX + 1];
-    if (callback) {
-        snprintf(self, sizeof self, "%s", callback);
-    } else {
-        char host[80];
-        host_for_url(local_ip, host, sizeof host);
-        snprintf(self, sizeof self, "http://%s:%d%s", host, port, r.path);
-    }
-
-    long status = push_register(&c, url_base, subject, consumer, self,
-                                token, batch, tail, from);
-    if (status != 200) {
-        if (status > 0) report_error(&c, status);
-        http11c_server_free(srv);
-        client_free(&c);
-        return g_stop ? 0 : 1;
-    }
-
-    fprintf(stderr, "bjmsg: receiving %s as '%s' on %s\n",
-            subject, consumer, self);
-
-    int rc = 0;
-    long since_beat = 0;
-    while (!g_stop) {
-        if (http11c_poll(srv, 1000) < 0) { rc = 1; break; }
-        if (heartbeat_ms <= 0) continue;
-
-        since_beat += 1000;
-        if (since_beat < heartbeat_ms) continue;
-        since_beat = 0;
-
-        /*
-         * Re-assert the subscription. It normally changes nothing, and
-         * that is the point: the one case it matters is a broker that no
-         * longer has us, which silence is indistinguishable from.
-         */
-        c.waiting = 0;
-        if (push_register(&c, url_base, subject, consumer, self,
-                          token, batch, tail, from) != 200 && !g_stop)
-            fprintf(stderr, "bjmsg: could not re-register the subscription\n");
-    }
-
-    /*
-     * Stop the deliveries before this process is not there to take them.
-     * One attempt, retries off: hanging on the way out is worse than a
-     * subscription the broker retires when its callback stops answering.
-     * The receipt survives either way — unregistering says "not here",
-     * not "forget where I was".
-     */
-    if (!keep) {
-        g_stop = 0;
-        c.retry_ms = 0;
-        c.waiting = 0;
-        if (push_unregister(&c, url_base, consumer, ephemeral) != 200)
-            fprintf(stderr, "bjmsg: could not unregister '%s'; the broker "
-                            "will keep trying to deliver to %s until it is "
-                            "removed (bjmsg unsubscribe)\n", consumer, self);
-    }
-
-    http11c_server_free(srv);
-    client_free(&c);
-    return rc;
+    receiver_spec sp;
+    memset(&sp, 0, sizeof sp);
+    sp.url_base = url_base;
+    sp.pattern = subject;
+    sp.consumer = consumer;
+    sp.bind_addr = bind_addr;
+    sp.callback = callback;
+    sp.token = token;
+    sp.path = r.path;
+    sp.batch = batch;
+    sp.from = from;
+    sp.retry_ms = retry_ms;
+    sp.heartbeat_ms = heartbeat_ms;
+    sp.port = port;
+    sp.tail = tail;
+    sp.keep = keep;
+    sp.ephemeral = ephemeral;
+    sp.handler = h_deliver;
+    sp.ctx = &r;
+    return receiver_run(&sp);
 }
 
 /* ---- query commands --------------------------------------------------- */
@@ -1053,6 +1128,10 @@ typedef struct {
     const char *text;      /* second positional, for request */
     uint64_t    timeout_ms;
     int         raw, follow;
+    /* For the commands that receive rather than ask: where to listen and
+     * what to tell the broker to connect to. */
+    const char *bind_addr, *callback, *token;
+    int         port;
 } query_opts;
 
 /* Returns 0 on success, or an exit code (2) on a bad argument. */
@@ -1167,6 +1246,16 @@ static int query_parse(int argc, char **argv, query_opts *o, const char *usage) 
         } else if (strcmp(a, "--interval") == 0) {
             const char *v = arg_value(argc, argv, &i, "--interval");
             if (!v || parse_ms(v, &o->interval_ms) != 0) return 2;
+        } else if (strcmp(a, "--bind") == 0) {
+            if (!(o->bind_addr = arg_value(argc, argv, &i, "--bind"))) return 2;
+        } else if (strcmp(a, "--callback") == 0) {
+            if (!(o->callback = arg_value(argc, argv, &i, "--callback"))) return 2;
+        } else if (strcmp(a, "--token") == 0) {
+            if (!(o->token = arg_value(argc, argv, &i, "--token"))) return 2;
+        } else if (strcmp(a, "--port") == 0) {
+            const char *v = arg_value(argc, argv, &i, "--port");
+            if (!v) return 2;
+            o->port = atoi(v);
         } else if (strcmp(a, "--ignore-consumers") == 0) {
             o->ignore_consumers = 1;
         } else if (strcmp(a, "--delete") == 0) {
@@ -1534,19 +1623,25 @@ int bjm_cmd_fail(int argc, char **argv) {
     return job_end(argc, argv, "fail", JOBEND_USAGE("fail"));
 }
 
-/* ---- the worker loop --------------------------------------------------- */
+/* ---- work: receiving pushed jobs --------------------------------------- */
 
 /*
- * One job's index and rendered payload, pulled out of a take response.
- * Only one job is taken at a time here: --exec runs them serially, and a
- * job held but not started is a job whose lease is burning down.
+ * A pushed worker is a push subscription with a group. The broker leases
+ * the jobs and POSTs them here; the reply settles them, so a worker never
+ * asks whether there is anything to do and an idle queue costs nothing.
+ *
+ * A job is not a message, and the difference is why the reply is not just
+ * a status: jobs finish out of order, so a high-water mark cannot say
+ * which ones did. With one job per delivery — the default, and what
+ * spreads a queue evenly across workers — 2xx finishes it and anything
+ * else returns it. Asking for more (--max) trades that for fewer round
+ * trips, and X-Bjmsg-Done then names the ones that succeeded.
  */
 typedef struct {
     char      key[16];
     long long index;
     long long attempts;
-    char     *text;
-    size_t    text_len;
+    buf       feed;
     int       have;
 } job;
 
@@ -1567,114 +1662,232 @@ static void job_int(void *ctx, double v) {
 static void job_binary(void *ctx, const uint8_t *bytes, uint32_t len) {
     job *j = ctx;
     if (j->have || strcmp(j->key, "payload") != 0) return;
-    FILE *f = open_memstream(&j->text, &j->text_len);
-    if (!f) return;
-    if (bjm_render(f, bytes, len) != BJ_OK) fputs("<undecodable>", f);
-    fclose(f);
+    feed_for(bytes, len, 0, &j->feed);
     j->have = 1;
 }
 
+typedef struct {
+    char        path[64];
+    char        token[BJM_TOKEN_MAX + 1];
+    const char *exec;
+    const char *group;
+    /* Indexes finished in this delivery, rendered into X-Bjmsg-Done. */
+    char        done[16 * BJM_PUSH_JOBS_MAX];
+    size_t      done_len;
+    int         ndone, nfailed;
+} worker;
+
+/* One job: environment, handler, verdict. */
+static int run_job(worker *w, const char *subject, const job *j) {
+    char env[32];
+    setenv("BJMSG_SUBJECT", subject, 1);
+    setenv("BJMSG_GROUP", w->group, 1);
+    snprintf(env, sizeof env, "%lld", j->index);
+    setenv("BJMSG_INDEX", env, 1);
+    /* >1 means this job was run before and its lease expired — the signal
+     * a handler needs to decide whether to guard itself. */
+    snprintf(env, sizeof env, "%lld", j->attempts);
+    setenv("BJMSG_ATTEMPTS", env, 1);
+
+    FILE *child = popen(w->exec, "w");
+    if (!child) {
+        fprintf(stderr, "bjmsg: cannot run '%s'\n", w->exec);
+        return 0;
+    }
+    if (j->feed.len) fwrite(j->feed.p, 1, j->feed.len, child);
+    int st = pclose(child);
+    return st != -1 && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+/*
+ * The decode hands one job at a time to the handler, because a take
+ * response is a flat array and the payload is the last field of each
+ * entry — so a job is complete exactly when its payload arrives.
+ */
+typedef struct {
+    worker     *w;
+    const char *subject;
+    job         cur;
+} job_scan;
+
+static void js_key(void *ctx, const uint8_t *k, uint32_t len) {
+    job_key(&((job_scan *)ctx)->cur, k, len);
+}
+
+static void js_int(void *ctx, double v) {
+    job_int(&((job_scan *)ctx)->cur, v);
+}
+
+static void js_binary(void *ctx, const uint8_t *bytes, uint32_t len) {
+    job_scan *sc = ctx;
+    if (strcmp(sc->cur.key, "payload") != 0) return;
+    sc->cur.have = 0;
+    job_binary(&sc->cur, bytes, len);
+    if (!sc->cur.have) return;
+
+    int ok = run_job(sc->w, sc->subject, &sc->cur);
+    printf("%lld\t%s\n", sc->cur.index, ok ? "done" : "failed");
+    fflush(stdout);
+
+    if (ok) {
+        sc->w->ndone++;
+        int n = snprintf(sc->w->done + sc->w->done_len,
+                         sizeof sc->w->done - sc->w->done_len,
+                         "%s%lld", sc->w->done_len ? "," : "", sc->cur.index);
+        if (n > 0 && (size_t)n < sizeof sc->w->done - sc->w->done_len)
+            sc->w->done_len += (size_t)n;
+    } else {
+        sc->w->nfailed++;
+    }
+    sc->cur.have = 0;
+}
+
+static void h_job(http11c_request *req, http11c_response *res) {
+    worker *w = http11c_req_ctx(req);
+
+    if (w->token[0]) {
+        const char *auth = http11c_req_header(req, "Authorization");
+        char want[BJM_TOKEN_MAX + 16];
+        snprintf(want, sizeof want, "Bearer %s", w->token);
+        if (!auth || strcmp(auth, want) != 0) {
+            http11c_res_header(res, "Content-Type", "text/plain");
+            http11c_res_text(res, 401, "bad or missing bearer token\n");
+            return;
+        }
+    }
+
+    const char *subject = http11c_req_header(req, "X-Bjmsg-Subject");
+    size_t len = 0;
+    const uint8_t *body = (const uint8_t *)http11c_req_body(req, &len);
+    if (!body || len == 0) {
+        http11c_res_header(res, "Content-Type", "text/plain");
+        http11c_res_text(res, 400, "empty delivery\n");
+        return;
+    }
+
+    w->done_len = 0;
+    w->done[0] = '\0';
+    w->ndone = w->nfailed = 0;
+
+    job_scan sc;
+    memset(&sc, 0, sizeof sc);
+    sc.w = w;
+    sc.subject = subject ? subject : "";
+
+    bj_visitor v = bjm_visitor_noop(&sc);
+    v.on_key = js_key;
+    v.on_int = js_int;
+    v.on_binary = js_binary;
+    int e = bj_decode(body, len, &v, NULL);
+    buf_free(&sc.cur.feed);
+
+    if (e != BJ_OK) {
+        http11c_res_header(res, "Content-Type", "text/plain");
+        http11c_res_text(res, 400, "malformed delivery\n");
+        return;
+    }
+
+    /*
+     * A 500 returns every job in the delivery, which is right when none
+     * of them ran. When some did, 200 plus the list is the only way to
+     * say so — the broker fails whatever the list omits.
+     */
+    if (w->ndone == 0) {
+        http11c_res_header(res, "Content-Type", "text/plain");
+        http11c_res_text(res, 500, "handler failed\n");
+        return;
+    }
+    if (w->nfailed)
+        http11c_res_header(res, "X-Bjmsg-Done", w->done);
+    http11c_res_header(res, "Content-Type", "text/plain");
+    http11c_res_text(res, 200, "");
+}
+
 #define WORK_USAGE \
-    "usage: bjmsg work [--url URL] <subject> --group G --exec CMD\n" \
-    "                  [--lease D] [--interval MS]\n" \
+    "usage: bjmsg work [--url URL] <subject|pattern> --group G --exec CMD\n" \
+    "                  [--max N] [--port P] [--callback URL] [--token T]\n" \
+    "                  [--consumer NAME] [--keep] [--retry MS]\n" \
     "\n" \
-    "Take one job at a time and run CMD for each. The payload is written\n" \
-    "to CMD's stdin, and BJMSG_SUBJECT / BJMSG_GROUP / BJMSG_INDEX /\n" \
-    "BJMSG_ATTEMPTS are set in its environment.\n" \
+    "Jobs are pushed, not polled: this starts a small HTTP server, tells\n" \
+    "the broker to lease jobs from the group and POST them to it, and runs\n" \
+    "CMD for each. An idle queue costs nothing, and a job becomes available\n" \
+    "the instant it is published.\n" \
+    "\n" \
+    "The payload is written to CMD's stdin, and BJMSG_SUBJECT /\n" \
+    "BJMSG_GROUP / BJMSG_INDEX / BJMSG_ATTEMPTS are set in its\n" \
+    "environment.\n" \
     "\n" \
     "CMD exiting 0 finishes the job; anything else returns it to the\n" \
-    "queue immediately. A job whose worker dies is redelivered when its\n" \
-    "lease expires, so CMD must tolerate running twice.\n"
+    "queue, due again after the group's backoff. A job whose worker dies\n" \
+    "is redelivered when its lease expires, so CMD must tolerate running\n" \
+    "twice.\n" \
+    "\n" \
+    "  --max N        jobs per delivery (default 1, which is what spreads\n" \
+    "                 a queue evenly across workers)\n" \
+    "  --consumer N   name this worker, so `bjmsg push` identifies it\n"
 
 int bjm_cmd_work(int argc, char **argv) {
     query_opts o;
     int rc = query_parse(argc, argv, &o, WORK_USAGE);
     if (rc) return rc == 1 ? 0 : rc;
-    if (!o.subject || !bjm_subject_valid(o.subject) ||
-        !o.group || !bjm_group_valid(o.group) || !o.exec) {
+    if (!o.subject || !o.group || !bjm_group_valid(o.group) || !o.exec) {
         fputs(WORK_USAGE, stderr);
         return 2;
     }
-    long idle = o.interval_ms > 0 ? o.interval_ms : DEFAULT_POLL_MS;
-
-    client c;
-    if (client_init(&c, o.retry_ms) != 0) return 1;
-
-    char url[1024];
-    take_url(url, sizeof url, &o, 1);
-
-    int failures = 0;
-    while (!g_stop) {
-        curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, "POST");
-        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, "");
-        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, 0L);
-
-        long status = client_perform(&c, url);
-        if (g_stop) break;
-        if (status < 0) { rc = 1; break; }
-        if (status != 200) {
-            if (status == 404) { sleep_ms(idle); continue; }  /* no subject yet */
-            report_error(&c, status);
-            rc = 1;
-            break;
-        }
-
-        job j = {0};
-        bj_visitor v = bjm_visitor_noop(&j);
-        v.on_key = job_key;
-        v.on_int = job_int;
-        v.on_binary = job_binary;
-        if (bj_decode(c.body.p, c.body.len, &v, NULL) != BJ_OK) {
-            fprintf(stderr, "bjmsg: malformed take response\n");
-            rc = 1;
-            break;
-        }
-        if (!j.have) { sleep_ms(idle); continue; }   /* queue is empty */
-
-        char env[32];
-        setenv("BJMSG_SUBJECT", o.subject, 1);
-        setenv("BJMSG_GROUP", o.group, 1);
-        snprintf(env, sizeof env, "%lld", j.index);
-        setenv("BJMSG_INDEX", env, 1);
-        /* >1 means this job was run before and its lease expired — the
-         * signal a handler needs to decide whether to guard itself. */
-        snprintf(env, sizeof env, "%lld", j.attempts);
-        setenv("BJMSG_ATTEMPTS", env, 1);
-
-        FILE *child = popen(o.exec, "w");
-        int ok = 0;
-        if (!child) {
-            fprintf(stderr, "bjmsg: cannot run '%s'\n", o.exec);
-        } else {
-            fputs(j.text ? j.text : "", child);
-            int st = pclose(child);
-            ok = (st == 0);
-        }
-        free(j.text);
-
-        /* Report the outcome on a second handle's worth of settings: the
-         * same connection, a different URL. */
-        char end[1024];
-        snprintf(end, sizeof end, "%s/%s/%s?group=%s&index=%lld",
-                 o.url_base, ok ? "done" : "fail", o.subject, o.group, j.index);
-        curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, "POST");
-        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, "");
-        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, 0L);
-        if (client_perform(&c, end) != 200 && !g_stop)
-            fprintf(stderr, "bjmsg: could not report job %lld as %s\n",
-                    j.index, ok ? "done" : "failed");
-
-        printf("%lld\t%s\n", j.index, ok ? "done" : "failed");
-        fflush(stdout);
-        /* No pause here: the broker's backoff already withholds the job
-         * this worker just failed, so there is nothing to spin on, and
-         * sleeping would only delay the *other* jobs waiting behind it. */
-        if (!ok) failures++;
+    int is_pattern = bjm_pattern_is(o.subject);
+    if (is_pattern ? !bjm_pattern_valid(o.subject)
+                   : !bjm_subject_valid(o.subject)) {
+        fprintf(stderr, "bjmsg: invalid %s '%s'\n",
+                is_pattern ? "pattern" : "subject", o.subject);
+        return 2;
     }
 
-    client_free(&c);
-    return rc ? rc : (failures ? 1 : 0);
+    const char *consumer = o.consumer, *token = o.token;
+    char generated[BJM_CONSUMER_MAX + 1], auto_token[65];
+    if (receiver_identity(&consumer, generated, sizeof generated, "work",
+                          &token, auto_token, sizeof auto_token) != 0) {
+        fprintf(stderr, "bjmsg: cannot read /dev/urandom\n");
+        return 1;
+    }
+
+    worker w;
+    memset(&w, 0, sizeof w);
+    snprintf(w.path, sizeof w.path, "/job");
+    snprintf(w.token, sizeof w.token, "%s", token);
+    w.exec = o.exec;
+    w.group = o.group;
+
+    receiver_spec sp;
+    memset(&sp, 0, sizeof sp);
+    sp.url_base = o.url_base;
+    sp.pattern = o.subject;
+    sp.consumer = consumer;
+    sp.group = o.group;
+    sp.bind_addr = o.bind_addr;
+    sp.callback = o.callback;
+    sp.token = token;
+    sp.path = w.path;
+    sp.max_jobs = o.max > 0 ? (uint64_t)o.max : 0;
+    sp.retry_ms = o.retry_ms;
+    sp.heartbeat_ms = DEFAULT_HEARTBEAT_MS;
+    sp.port = o.port;
+    /*
+     * A worker always unregisters on exit, with no --keep to leave it
+     * behind: the broker would go on leasing jobs to a callback that is
+     * not there, and each one would sit out its lease before anyone else
+     * could have it. A subscriber left registered merely accumulates a
+     * backlog; a worker left registered holds jobs hostage.
+     *
+     * Nothing to purge either — a worker holds no receipt, because the
+     * group's cursor is shared by every member.
+     */
+    sp.keep = 0;
+    sp.ephemeral = 0;
+    sp.handler = h_job;
+    sp.ctx = &w;
+    return receiver_run(&sp);
 }
+
 
 /* ---- request / reply ---------------------------------------------------- */
 

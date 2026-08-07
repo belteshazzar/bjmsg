@@ -74,7 +74,25 @@ typedef struct {
     char     resp[192];
     size_t   resp_len;
 
+    /*
+     * A worker delivery instead of a subscriber one: the jobs leased for
+     * it, and X-Bjmsg-Done naming those the worker actually finished. A
+     * receipt cannot express this — jobs complete out of order — so each
+     * index is settled individually when the reply comes back.
+     */
+    uint64_t jobs[BJM_PUSH_JOBS_MAX];
+    int      njobs;
+    uint64_t done_list[BJM_PUSH_JOBS_MAX];
+    int      ndone;
+    int      has_done_list;
+
     uint64_t due_ms;               /* not before this: backoff */
+    /*
+     * A queue lease this worker's group holds is due to lapse then, so
+     * there will be a job to hand out even if nobody publishes. Set by a
+     * take that found nothing; cleared by the next attempt.
+     */
+    uint64_t wake_ms;
     int      failures;
     char     last_error[128];
     uint64_t delivered;            /* messages acknowledged, for reporting */
@@ -166,21 +184,37 @@ static size_t on_body(char *data, size_t size, size_t nmemb, void *user) {
     return n;
 }
 
+/* Case-insensitive "starts with", answering where the value begins. */
+static size_t hdr_is(const char *data, size_t n, const char *name) {
+    size_t wn = strlen(name);
+    if (n <= wn) return 0;
+    for (size_t i = 0; i < wn; i++) {
+        char c = data[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != name[i]) return 0;
+    }
+    return wn;
+}
+
 static size_t on_hdr(char *data, size_t size, size_t nmemb, void *user) {
     psub *s = user;
-    size_t n = size * nmemb;
-    static const char want[] = "x-bjmsg-ack:";
-    size_t wn = sizeof want - 1;
-    if (n > wn) {
-        size_t i = 0;
-        for (; i < wn; i++) {
-            char c = data[i];
-            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-            if (c != want[i]) break;
-        }
-        if (i == wn) {
-            s->ack_hint = strtoull(data + wn, NULL, 10);
-            s->has_ack_hint = 1;
+    size_t n = size * nmemb, at;
+    if ((at = hdr_is(data, n, "x-bjmsg-ack:"))) {
+        s->ack_hint = strtoull(data + at, NULL, 10);
+        s->has_ack_hint = 1;
+    } else if ((at = hdr_is(data, n, "x-bjmsg-done:"))) {
+        /* A comma-separated list of the jobs the worker actually
+         * finished. Absent means all of them. */
+        s->has_done_list = 1;
+        s->ndone = 0;
+        const char *p = data + at, *end = data + n;
+        while (p < end && s->ndone < BJM_PUSH_JOBS_MAX) {
+            while (p < end && (*p < '0' || *p > '9')) p++;
+            if (p >= end) break;
+            uint64_t v = 0;
+            while (p < end && *p >= '0' && *p <= '9')
+                v = v * 10 + (uint64_t)(*p++ - '0');
+            s->done_list[s->ndone++] = v;
         }
     }
     return n;
@@ -366,14 +400,149 @@ static void hdr_add(struct curl_slist **l, const char *fmt, ...) {
 }
 
 /*
+ * Hand the batch already in s->body to libcurl. Everything a subscriber
+ * needs to place the batch travels in headers, so the body stays exactly
+ * the bytes the log produced.
+ */
+static int send_batch(bjm_pusher *p, psub *s, int count) {
+    snprintf(s->url, sizeof s->url, "%s", s->cfg.callback);
+
+    if (s->hdrs) { curl_slist_free_all(s->hdrs); s->hdrs = NULL; }
+    hdr_add(&s->hdrs, "Content-Type: %s", BJMSG_MEDIA_TYPE);
+    hdr_add(&s->hdrs, "X-Bjmsg-Subject: %s", s->subject);
+    hdr_add(&s->hdrs, "X-Bjmsg-Consumer: %s", s->consumer);
+    hdr_add(&s->hdrs, "X-Bjmsg-Count: %d", count);
+    hdr_add(&s->hdrs, "X-Bjmsg-First-Index: %llu",
+            (unsigned long long)s->first);
+    hdr_add(&s->hdrs, "X-Bjmsg-Last-Index: %llu",
+            (unsigned long long)s->last);
+    if (s->cfg.group[0])
+        hdr_add(&s->hdrs, "X-Bjmsg-Group: %s", s->cfg.group);
+    else
+        /* How much is still waiting after this batch, so a subscriber can
+         * tell "keep up" from "catch up" without asking. A queue has no
+         * such number to give: what is waiting is whatever no other
+         * worker has taken by the time this one asks. */
+        hdr_add(&s->hdrs, "X-Bjmsg-Lag: %llu", (unsigned long long)s->lag);
+    if (s->cfg.token[0])
+        hdr_add(&s->hdrs, "Authorization: Bearer %s", s->cfg.token);
+    /* libcurl adds Expect: 100-continue to larger POSTs and then waits a
+     * second for a response http11c does not send. */
+    hdr_add(&s->hdrs, "Expect:");
+
+    s->resp_len = 0;
+    s->resp[0] = '\0';
+    s->has_ack_hint = 0;
+    s->ack_hint = 0;
+    s->has_done_list = 0;
+    s->ndone = 0;
+
+    curl_easy_setopt(s->easy, CURLOPT_URL, s->url);
+    curl_easy_setopt(s->easy, CURLOPT_HTTPHEADER, s->hdrs);
+    curl_easy_setopt(s->easy, CURLOPT_POSTFIELDS, (const char *)s->body);
+    curl_easy_setopt(s->easy, CURLOPT_POSTFIELDSIZE_LARGE,
+                     (curl_off_t)s->body_len);
+
+    if (curl_multi_add_handle(p->multi, s->easy) != CURLM_OK) return -1;
+    s->inflight = 1;
+    p->inflight++;
+    return 0;
+}
+
+/* Collect the `index` of each entry in a take response. */
+typedef struct { char key[16]; psub *s; } job_grab;
+
+static void jg_key(void *ctx, const uint8_t *k, uint32_t len) {
+    job_grab *g = ctx;
+    if (len >= sizeof g->key) len = sizeof g->key - 1;
+    memcpy(g->key, k, len);
+    g->key[len] = '\0';
+}
+
+static void jg_int(void *ctx, double v) {
+    job_grab *g = ctx;
+    if (strcmp(g->key, "index") != 0) return;
+    if (g->s->njobs < BJM_PUSH_JOBS_MAX)
+        g->s->jobs[g->s->njobs++] = (uint64_t)v;
+}
+
+/*
+ * Lease jobs for a pushed worker. A queue subscription reads nothing and
+ * acks nothing: what it delivers is the take, and what settles it is
+ * done/fail per index once the worker replies.
+ */
+static int take_batch(bjm_pusher *p, psub *s, const char *name,
+                      int *count, const uint8_t **out, size_t *out_len) {
+    uint64_t want = s->cfg.max_jobs ? s->cfg.max_jobs : 1;
+    if (want > BJM_PUSH_JOBS_MAX) want = BJM_PUSH_JOBS_MAX;
+
+    /* UINT64_MAX: whatever lease the group is configured for. */
+    if (bjm_take(p->st, name, s->cfg.group, (int)want, UINT64_MAX,
+                 count, out, out_len) != BJ_OK)
+        return -1;
+    if (*count == 0) return 0;
+
+    s->njobs = 0;
+    job_grab g = { {0}, s };
+    bj_visitor v = bjm_visitor_noop(&g);
+    v.on_key = jg_key;
+    v.on_int = jg_int;
+    if (bj_decode(*out, *out_len, &v, NULL) != BJ_OK || s->njobs == 0)
+        return -1;
+    return 1;
+}
+
+/*
  * Find this subscription's next batch and start delivering it. Returns 1
  * if a delivery was started, 0 if there was nothing to send.
  */
 static int start_delivery(bjm_pusher *p, psub *s) {
+    int is_queue = s->cfg.group[0] != '\0';
+    s->wake_ms = 0;
+
     for (int n = 0; n < p->nnames; n++) {
         int i = (s->rr + n) % p->nnames;
         const char *name = p->names[i].name;
         if (!matches(s, name)) continue;
+
+        if (is_queue) {
+            int count = 0;
+            const uint8_t *out = NULL;
+            size_t out_len = 0;
+            int got = take_batch(p, s, name, &count, &out, &out_len);
+            if (got <= 0) {
+                /*
+                 * Nothing available now, but a lease this group is
+                 * holding may lapse and make its job available again.
+                 * Note when, so the worker wakes then rather than
+                 * re-asking on a timer.
+                 */
+                int pending = 0;
+                uint64_t due = 0;
+                if (bjm_queue_next_due(p->st, name, s->cfg.group,
+                                       &pending, &due) == BJ_OK && pending &&
+                    (!s->wake_ms || due < s->wake_ms))
+                    s->wake_ms = due;
+                continue;
+            }
+
+            if (out_len > s->body_cap) {
+                uint8_t *q = realloc(s->body, out_len);
+                if (!q) return 0;
+                s->body = q;
+                s->body_cap = out_len;
+            }
+            memcpy(s->body, out, out_len);
+            s->body_len = out_len;
+
+            snprintf(s->subject, sizeof s->subject, "%s", name);
+            s->first = s->jobs[0];
+            s->last  = s->jobs[s->njobs - 1];
+            s->lag = 0;
+            s->rr = (i + 1) % p->nnames;
+            if (send_batch(p, s, count) != 0) return 0;
+            return 1;
+        }
 
         uint64_t base = 0, last = 0, bytes = 0;
         if (bjm_subject_info(p->st, name, &base, &last, &bytes) != BJ_OK)
@@ -439,44 +608,13 @@ static int start_delivery(bjm_pusher *p, psub *s) {
         s->lag  = log_last > s->last ? log_last - s->last : 0;
         s->rr = (i + 1) % p->nnames;   /* fairness: next subject goes first */
 
-        snprintf(s->url, sizeof s->url, "%s", s->cfg.callback);
-
-        if (s->hdrs) { curl_slist_free_all(s->hdrs); s->hdrs = NULL; }
-        hdr_add(&s->hdrs, "Content-Type: %s", BJMSG_MEDIA_TYPE);
-        hdr_add(&s->hdrs, "X-Bjmsg-Subject: %s", s->subject);
-        hdr_add(&s->hdrs, "X-Bjmsg-Consumer: %s", s->consumer);
-        hdr_add(&s->hdrs, "X-Bjmsg-Count: %d", count);
-        hdr_add(&s->hdrs, "X-Bjmsg-First-Index: %llu",
-                (unsigned long long)s->first);
-        hdr_add(&s->hdrs, "X-Bjmsg-Last-Index: %llu",
-                (unsigned long long)s->last);
-        /* How much is still waiting after this batch, so a subscriber can
-         * tell "keep up" from "catch up" without asking. */
-        hdr_add(&s->hdrs, "X-Bjmsg-Lag: %llu", (unsigned long long)s->lag);
-        if (s->cfg.token[0])
-            hdr_add(&s->hdrs, "Authorization: Bearer %s", s->cfg.token);
-        /* libcurl adds Expect: 100-continue to larger POSTs and then waits
-         * a second for a response http11c does not send. */
-        hdr_add(&s->hdrs, "Expect:");
-
-        s->resp_len = 0;
-        s->resp[0] = '\0';
-        s->has_ack_hint = 0;
-        s->ack_hint = 0;
-
-        curl_easy_setopt(s->easy, CURLOPT_URL, s->url);
-        curl_easy_setopt(s->easy, CURLOPT_HTTPHEADER, s->hdrs);
-        curl_easy_setopt(s->easy, CURLOPT_POSTFIELDS, (const char *)s->body);
-        curl_easy_setopt(s->easy, CURLOPT_POSTFIELDSIZE_LARGE,
-                         (curl_off_t)s->body_len);
-
-        if (curl_multi_add_handle(p->multi, s->easy) != CURLM_OK) return 0;
-        s->inflight = 1;
-        p->inflight++;
+        if (send_batch(p, s, count) != 0) return 0;
         return 1;
     }
     return 0;
 }
+
+static void backoff(psub *s, uint64_t now);
 
 static void backoff(psub *s, uint64_t now) {
     s->failures++;
@@ -485,6 +623,76 @@ static void backoff(psub *s, uint64_t now) {
         wait *= 2;
     if (wait > PUSH_MAX_BACKOFF_MS) wait = PUSH_MAX_BACKOFF_MS;
     s->due_ms = now + wait;
+}
+
+/*
+ * Settle the jobs a worker was leased, once it has replied.
+ *
+ * A transport failure deliberately settles nothing. The worker never got
+ * the jobs — or never answered about them — which is exactly the case the
+ * lease exists for: it expires and the jobs are handed out again, without
+ * a `fail` claiming somebody tried and could not. An HTTP error *is* the
+ * worker answering, and that is a real attempt.
+ */
+static void finish_jobs(bjm_pusher *p, psub *s, CURLcode rc, long status,
+                        uint64_t now) {
+    int answered = (rc == CURLE_OK);
+    int ok = answered && status >= 200 && status < 300;
+
+    if (!answered) {
+        snprintf(s->last_error, sizeof s->last_error, "%s",
+                 curl_easy_strerror(rc));
+        if (s->failures == 0)
+            fprintf(stderr, "bjmsg: work %s -> %s: %s (jobs left to their "
+                            "leases; retrying)\n",
+                    s->consumer, s->url, s->last_error);
+        backoff(s, now);
+        return;
+    }
+
+    for (int i = 0; i < s->njobs; i++) {
+        uint64_t idx = s->jobs[i];
+        int finished = ok;
+        if (ok && s->has_done_list) {
+            finished = 0;
+            for (int j = 0; j < s->ndone; j++)
+                if (s->done_list[j] == idx) { finished = 1; break; }
+        }
+        int found = 0;
+        if (finished) {
+            bjm_done(p->st, s->subject, s->cfg.group, idx, &found);
+            s->delivered++;
+        } else {
+            /* UINT64_MAX: the group's own backoff decides when this job
+             * becomes due again, which is where that policy belongs. */
+            uint64_t retry_in = 0;
+            bjm_fail(p->st, s->subject, s->cfg.group, idx, UINT64_MAX,
+                     &found, &retry_in);
+        }
+    }
+    s->njobs = 0;
+
+    if (!ok) {
+        snprintf(s->last_error, sizeof s->last_error, "HTTP %ld%s%.*s",
+                 status, s->resp_len ? ": " : "", (int)s->resp_len, s->resp);
+        /*
+         * The jobs are already back in the queue with the group's
+         * backoff, so this pause is about the *worker*: one that answers
+         * with an error for everything should not be handed the whole
+         * queue as fast as it can refuse it.
+         */
+        backoff(s, now);
+        return;
+    }
+
+    if (s->failures) {
+        fprintf(stderr, "bjmsg: work %s -> %s: taking jobs again\n",
+                s->consumer, s->url);
+        s->failures = 0;
+        s->last_error[0] = '\0';
+    }
+    s->due_ms = 0;
+    p->work = 1;
 }
 
 static void finish(bjm_pusher *p, psub *s, CURLcode rc, uint64_t now) {
@@ -502,6 +710,8 @@ static void finish(bjm_pusher *p, psub *s, CURLcode rc, uint64_t now) {
     long status = 0;
     if (rc == CURLE_OK)
         curl_easy_getinfo(s->easy, CURLINFO_RESPONSE_CODE, &status);
+
+    if (s->cfg.group[0]) { finish_jobs(p, s, rc, status, now); return; }
 
     if (rc != CURLE_OK || status < 200 || status >= 300) {
         if (rc != CURLE_OK)
@@ -577,6 +787,11 @@ int bjm_pusher_pump(bjm_pusher *p, uint64_t now) {
                 continue;
             }
             started += start_delivery(p, s);
+            /* A worker with nothing to do but a lease about to lapse. */
+            if (s->wake_ms) {
+                busy = 1;
+                if (!next_due || s->wake_ms < next_due) next_due = s->wake_ms;
+            }
         }
         /*
          * A pass that asked every eligible subscription and found nothing
@@ -627,6 +842,9 @@ int bjm_pusher_list(bjm_pusher *p, const uint8_t **out, size_t *out_len) {
         bj_put_key(b, (const uint8_t *)"callback", 8);
         bj_put_string(b, (const uint8_t *)s->cfg.callback,
                       (uint32_t)strlen(s->cfg.callback));
+        bj_put_key(b, (const uint8_t *)"group", 5);
+        bj_put_string(b, (const uint8_t *)s->cfg.group,
+                      (uint32_t)strlen(s->cfg.group));
         bj_put_key(b, (const uint8_t *)"delivered", 9);
         bj_put_int(b, (int64_t)s->delivered);
         bj_put_key(b, (const uint8_t *)"inflight", 8);

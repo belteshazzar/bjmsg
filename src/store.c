@@ -729,6 +729,7 @@ static void pu_string(void *ctx, const uint8_t *v, uint32_t len) {
     if (strcmp(g->key, "pattern") == 0)  { dst = g->s->pattern;  cap = sizeof g->s->pattern; }
     else if (strcmp(g->key, "callback") == 0) { dst = g->s->callback; cap = sizeof g->s->callback; }
     else if (strcmp(g->key, "token") == 0)    { dst = g->s->token;    cap = sizeof g->s->token; }
+    else if (strcmp(g->key, "group") == 0)    { dst = g->s->group;    cap = sizeof g->s->group; }
     if (!dst) return;
     if (len >= cap) len = (uint32_t)cap - 1;
     memcpy(dst, v, len);
@@ -737,7 +738,8 @@ static void pu_string(void *ctx, const uint8_t *v, uint32_t len) {
 
 static void pu_int(void *ctx, double v) {
     push_grab *g = ctx;
-    if (strcmp(g->key, "batch_bytes") == 0) g->s->batch_bytes = (uint64_t)v;
+    if (strcmp(g->key, "batch_bytes") == 0)   g->s->batch_bytes = (uint64_t)v;
+    else if (strcmp(g->key, "max_jobs") == 0) g->s->max_jobs = (uint64_t)v;
 }
 
 int bjm_push_get(bjm_store *st, const char *consumer, int *found,
@@ -778,6 +780,10 @@ int bjm_push_set(bjm_store *st, const char *consumer, const bjm_push_sub *s) {
     bj_put_string(b, (const uint8_t *)s->token, (uint32_t)strlen(s->token));
     bj_put_key(b, (const uint8_t *)"batch_bytes", 11);
     bj_put_int(b, (int64_t)s->batch_bytes);
+    bj_put_key(b, (const uint8_t *)"group", 5);
+    bj_put_string(b, (const uint8_t *)s->group, (uint32_t)strlen(s->group));
+    bj_put_key(b, (const uint8_t *)"max_jobs", 8);
+    bj_put_int(b, (int64_t)s->max_jobs);
     bj_end_object(b);
 
     size_t len = 0;
@@ -2007,6 +2013,38 @@ int bjm_queues(bjm_store *st, const char *subject,
     if (e) return e;
     *out = bj_builder_data(b, out_len);
     return *out ? BJ_OK : BJ_ERR_STATE;
+}
+
+/*
+ * When this group next has work that nobody is holding — the earliest
+ * lease or retry delay that has yet to expire. *pending is 0 when the
+ * group is idle, and then only a publish can give it something to do.
+ *
+ * This is what lets a pushed worker sit still. Otherwise the broker would
+ * have to re-ask its own queue on a timer to notice that a lease lapsed,
+ * which is the shape of thing this whole change exists to remove — even
+ * where it would only be a local read.
+ */
+int bjm_queue_next_due(bjm_store *st, const char *subject, const char *group,
+                       int *pending, uint64_t *due_ms) {
+    *pending = 0;
+    *due_ms = 0;
+    int e = queues_open(st);
+    if (e) return e;
+
+    qrec *q = st->qscratch;
+    if (!q) return BJ_ERR_STATE;
+
+    int existed = 0;
+    e = queue_load(st, subject, group, q, &existed);
+    if (e || !existed) return e;
+
+    for (int i = 0; i + 2 < q->nfl; i += 3) {
+        uint64_t expires = q->fl[i + 1];
+        if (!*pending || expires < *due_ms) *due_ms = expires;
+        *pending = 1;
+    }
+    return BJ_OK;
 }
 
 int bjm_queue_floor(bjm_store *st, const char *subject,

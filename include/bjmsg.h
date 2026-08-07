@@ -174,6 +174,10 @@ int bjm_consumer_stats(bjm_store *st, const char *subject,
 /* Highest index currently in `subject`, or 0 if it does not exist. */
 uint64_t bjm_last_index(bjm_store *st, const char *subject);
 
+/* Group names follow the consumer rules; declared here because a push
+ * subscription may name one. The queue machinery is further down. */
+#define BJM_GROUP_MAX 128
+
 /* ---- push subscriptions ------------------------------------------------ */
 
 /*
@@ -197,7 +201,24 @@ typedef struct {
     char     callback[BJM_CALLBACK_MAX + 1];
     char     token[BJM_TOKEN_MAX + 1];      /* "" for none; sent as Bearer */
     uint64_t batch_bytes;                   /* 0 = the broker's default    */
+    /*
+     * With a group set, this is a pushed *worker* rather than a
+     * subscriber: the broker leases jobs instead of reading from a
+     * receipt, and the response completes them. See BJM_PUSH_JOBS_MAX.
+     */
+    char     group[BJM_GROUP_MAX + 1];      /* "" for a plain subscription */
+    uint64_t max_jobs;                      /* 0 = one job per delivery    */
 } bjm_push_sub;
+
+/*
+ * How many jobs one delivery may carry. One is the default because it
+ * makes the reply unambiguous — 2xx finished it, anything else did not —
+ * and because handing workers one job at a time is what spreads a queue
+ * evenly across them. Asking for more trades that for fewer round trips,
+ * and then a worker that finished only some of them says which in
+ * X-Bjmsg-Done.
+ */
+#define BJM_PUSH_JOBS_MAX 64
 
 int bjm_callback_valid(const char *url);
 int bjm_token_valid(const char *s);
@@ -329,7 +350,6 @@ int bjm_dedup_record(bjm_store *st, const char *subject, const char *id,
  * `next` and records nothing, which is at-most-once and loses the job if
  * the worker dies.
  */
-#define BJM_GROUP_MAX 128
 #define BJM_INFLIGHT_MAX 256
 #define BJM_LEASE_DEFAULT_MS 30000
 #define BJM_DEAD_MAX 64
@@ -400,6 +420,15 @@ int bjm_queues(bjm_store *st, const char *subject,
  */
 int bjm_queue_floor(bjm_store *st, const char *subject,
                     uint64_t *floor, int *ngroups);
+
+/*
+ * When this group next has work nobody is holding: the earliest lease or
+ * retry delay still to expire. *pending is 0 when it is idle, and then
+ * only a publish can give it something to do — which is what lets a
+ * pushed worker wait on an event rather than re-ask on a timer.
+ */
+int bjm_queue_next_due(bjm_store *st, const char *subject, const char *group,
+                       int *pending, uint64_t *due_ms);
 
 /*
  * Republish a dead-lettered message back to the subject it came from.
