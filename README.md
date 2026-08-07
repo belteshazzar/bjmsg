@@ -68,6 +68,7 @@ bare `curl` against a broken request is readable.
 | `POST /take/<subject>` | `?group=&max=&lease=` | ARRAY of `{ index, attempts, expires_ms, payload }` |
 | `POST /done/<subject>` | `?group=&index=` | `{ subject, group, index, held }` |
 | `POST /fail/<subject>` | `?group=&index=[&delay=]` | `{ …, held, retry_in_ms }` |
+| `POST /requeue/<subject>` | `?index=` (into `<subject>.dead`) | `{ subject, from_dead_index, index }` |
 | `GET /queue/<subject>` | | ARRAY of group states |
 | `PUT /queue/<subject>` | `?group=&lease_ms=&max_attempts=&backoff_ms=&max_backoff_ms=` | the stored groups |
 | `DELETE /queue/<subject>` | `?group=` | `{ subject, group, deleted }` |
@@ -250,19 +251,43 @@ as fast as the network allows. With backoff, the retries spread out and
 other jobs keep flowing past. `--backoff 0` restores instant retry.
 
 `--max-attempts` (default 10) is the other half. A job delivered that many
-times without finishing is dropped and counted as dead rather than retried
-forever:
-
-```sh
-bjmsg queue jobs --group workers --lease 30s --max-attempts 3
-bjmsg queue jobs
-[{"group":"workers","next":7,"pending":0,"inflight":0,"expired":0,
-  "lease_ms":30000,"max_attempts":4,"backoff_ms":1000,
-  "max_backoff_ms":300000,"dead":1,"dead_indexes":[4]}]
-```
+times without finishing stops being retried:
 
 `--lease 0` opts out of the whole mechanism: jobs are taken and forgotten,
 which is at-most-once and loses the job if the worker dies.
+
+### The dead-letter channel
+
+A job that runs out of attempts is republished to **`<subject>.dead`**,
+which is an ordinary subject — so every tool that works on a subject works
+on it. Inspect it, bound it with a retention policy, even consume it with
+its own queue group.
+
+```sh
+bjmsg dead jobs
+1  workers  orig=3  attempts=3  "poison task"
+
+bjmsg requeue jobs --index 1     # put it back after fixing the handler
+{"subject":"jobs","from_dead_index":1,"index":4}
+```
+
+The message there is an **envelope** — `{ subject, group, index, attempts,
+failed_ms, payload }` — because the payload alone does not say which group
+gave up on it or how many times it was tried. `bjmsg dead` renders it; a
+plain `sub jobs.dead` shows the envelope with the payload as hex, since
+the payload is stored as BINARY so requeue can hand the exact original
+bytes back to the log.
+
+`requeue` publishes to the subject the **envelope names**, not the one you
+asked for, so it cannot be used to move a message between subjects. The
+message is appended with a **new index** — the original is still in the
+log and still dead, and reusing its id would misrepresent the ordering.
+The dead-letter record stays put, so the history of what failed is not
+erased by fixing it.
+
+A subject already ending in `.dead` gets no channel of its own, which
+stops `jobs.dead.dead.dead` when a group is consuming a dead-letter
+channel and its jobs also fail.
 
 ### What you give up
 
@@ -395,9 +420,9 @@ What a reader sees after a trim depends on which kind of cursor it holds:
   `take` returns nothing until acks come in, which is backpressure rather
   than an error — but it does bound how many jobs one group can have
   running at once.
-- **Dead-lettered jobs are counted, not moved.** `queue` reports their
-  indexes and they stay in the log; nothing routes them to a dead-letter
-  subject for reprocessing.
+- **Nothing bounds a dead-letter channel automatically.** It is a normal
+  subject, so give it a retention policy —
+  `bjmsg policy jobs.dead --max-age 30d` — or it grows without limit.
 - **Consumer names are asserted, not authenticated.** Any client claiming
   a name advances that subscription's receipt.
 - **The retention sweep is O(subjects with policies).** Fine for tens or

@@ -74,6 +74,7 @@ struct bjm_store {
     size_t      nsubs, cap;
     bj_builder *bld;      /* scratch for bjm_subjects / bjm_consumers */
     bj_builder *cbld;     /* scratch for cursor and policy values     */
+    bj_builder *dbld;     /* scratch for dead-letter envelopes        */
     bj_io       cursors_io;
     bpt        *cursors;  /* opened on first use */
     bj_io       policy_io;
@@ -125,8 +126,10 @@ bjm_store *bjm_store_open(const char *dir) {
     }
     st->bld = bj_builder_new();
     st->cbld = bj_builder_new();
-    if (!st->bld || !st->cbld) {
+    st->dbld = bj_builder_new();
+    if (!st->bld || !st->cbld || !st->dbld) {
         bj_builder_free(st->bld); bj_builder_free(st->cbld);
+        bj_builder_free(st->dbld);
         bjns_posix_free(&st->ns); free(st); close(dirfd); return NULL;
     }
     return st;
@@ -157,6 +160,7 @@ void bjm_store_free(bjm_store *st) {
     free(st->qscratch);
     bj_builder_free(st->bld);
     bj_builder_free(st->cbld);
+    bj_builder_free(st->dbld);
     bjns_posix_free(&st->ns);
     close(st->dirfd);
     free(st);
@@ -771,6 +775,22 @@ typedef struct qrec {
 #define FL_ATTEMPTS(q, i) ((q)->fl[(i) * 3 + 2])
 #define FL_COUNT(q)      ((q)->nfl / 3)
 
+/*
+ * The dead-letter channel for `subject`. Returns 0 when there cannot be
+ * one: either the name would not fit, or the subject is already a
+ * dead-letter channel, which stops a chain of ".dead.dead.dead" when a
+ * queue group is consuming a DLQ and its jobs also fail.
+ */
+static int dead_subject_of(const char *subject, char *out, size_t cap) {
+    size_t n = strlen(subject);
+    const size_t suffix = sizeof BJM_DEAD_SUFFIX - 1;
+    if (n >= suffix && strcmp(subject + n - suffix, BJM_DEAD_SUFFIX) == 0)
+        return 0;
+    int w = snprintf(out, cap, "%s%s", subject, BJM_DEAD_SUFFIX);
+    if (w < 0 || (size_t)w >= cap || !bjm_subject_valid(out)) return 0;
+    return 1;
+}
+
 static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -969,6 +989,11 @@ int bjm_take(bjm_store *st, const char *subject_name, const char *group,
     uint64_t chosen[BJM_INFLIGHT_MAX];
     uint64_t attempts[BJM_INFLIGHT_MAX];
     int n = 0;
+    /* Jobs that ran out of attempts during this call, routed to the
+     * dead-letter channel once the take itself is finished. */
+    uint64_t dead_idx[BJM_INFLIGHT_MAX];
+    uint64_t dead_att[BJM_INFLIGHT_MAX];
+    int ndead_now = 0;
 
     /*
      * Expired leases first. A job whose worker died is older work than
@@ -992,6 +1017,11 @@ int bjm_take(bjm_store *st, const char *subject_name, const char *group,
                 q->ndead--;
             }
             q->dead[q->ndead++] = dead_index;
+            if (ndead_now < (int)(sizeof dead_idx / sizeof dead_idx[0])) {
+                dead_idx[ndead_now] = dead_index;
+                dead_att[ndead_now] = FL_ATTEMPTS(q, i);
+                ndead_now++;
+            }
             fl_remove(q, i);
             i--;                     /* fl_remove moved another entry here */
             continue;
@@ -1048,11 +1078,130 @@ int bjm_take(bjm_store *st, const char *subject_name, const char *group,
         (*count)++;
     }
     bj_end_array(b);
-
     e = bj_builder_error(b);
     if (e) return e;
+
+    /*
+     * Dead-letter last, and never earlier: publishing opens another
+     * subject, which can reallocate the store's subject table and
+     * invalidate `s`. Re-acquire it each time round rather than carrying
+     * the old pointer across. The response is already built in st->bld,
+     * and publishing does not touch that builder.
+     */
+    char dead[BJM_SUBJECT_MAX + 1];
+    if (ndead_now > 0 && dead_subject_of(subject_name, dead, sizeof dead)) {
+        for (int i = 0; i < ndead_now; i++) {
+            subject *src;
+            if (subject_get(st, subject_name, 0, &src) != BJ_OK) break;
+
+            uint64_t dterm;
+            int dtype;
+            const uint8_t *payload;
+            size_t plen;
+            if (elog_get(src->log, dead_idx[i], &dterm, &dtype,
+                         &payload, &plen) != BJ_OK)
+                continue;
+
+            bj_builder *d = st->dbld;
+            bj_builder_reset(d);
+            bj_begin_object(d);
+            bj_put_key(d, (const uint8_t *)"subject", 7);
+            bj_put_string(d, (const uint8_t *)subject_name,
+                          (uint32_t)strlen(subject_name));
+            bj_put_key(d, (const uint8_t *)"group", 5);
+            bj_put_string(d, (const uint8_t *)group, (uint32_t)strlen(group));
+            bj_put_key(d, (const uint8_t *)"index", 5);
+            bj_put_int(d, (int64_t)dead_idx[i]);
+            bj_put_key(d, (const uint8_t *)"attempts", 8);
+            bj_put_int(d, (int64_t)dead_att[i]);
+            bj_put_key(d, (const uint8_t *)"failed_ms", 9);
+            bj_put_int(d, (int64_t)now);
+            /* BINARY rather than spliced raw: requeue has to hand these
+             * exact bytes back to the log, and a binary field gives the
+             * decoder their extent for free. */
+            bj_put_key(d, (const uint8_t *)"payload", 7);
+            bj_put_binary(d, payload, (uint32_t)plen);
+            bj_end_object(d);
+
+            size_t dlen = 0;
+            const uint8_t *dv = bj_builder_data(d, &dlen);
+            uint64_t at = 0;
+            if (dv) bjm_publish(st, dead, dv, (uint32_t)dlen, &at);
+        }
+    }
+
     *out = bj_builder_data(b, out_len);
     return *out ? BJ_OK : BJ_ERR_STATE;
+}
+
+/* ---- requeue ----------------------------------------------------------- */
+
+/* Pull `subject` and `payload` back out of a dead-letter envelope. */
+typedef struct {
+    char     key[16];
+    char     subject[BJM_SUBJECT_MAX + 1];
+    uint8_t *payload;
+    size_t   plen;
+} envelope;
+
+static void env_key(void *ctx, const uint8_t *k, uint32_t len) {
+    envelope *v = ctx;
+    if (len >= sizeof v->key) len = sizeof v->key - 1;
+    memcpy(v->key, k, len);
+    v->key[len] = '\0';
+}
+
+static void env_string(void *ctx, const uint8_t *sv, uint32_t len) {
+    envelope *v = ctx;
+    if (strcmp(v->key, "subject") != 0) return;
+    if (len > BJM_SUBJECT_MAX) len = BJM_SUBJECT_MAX;
+    memcpy(v->subject, sv, len);
+    v->subject[len] = '\0';
+}
+
+static void env_binary(void *ctx, const uint8_t *b, uint32_t len) {
+    envelope *v = ctx;
+    if (strcmp(v->key, "payload") != 0 || v->payload) return;
+    /* Copied: publishing reuses the log buffer this points into. */
+    v->payload = malloc(len ? len : 1);
+    if (!v->payload) return;
+    memcpy(v->payload, b, len);
+    v->plen = len;
+}
+
+int bjm_requeue(bjm_store *st, const char *subject_name, uint64_t dlq_index,
+                uint64_t *new_index) {
+    char dead[BJM_SUBJECT_MAX + 1];
+    if (!dead_subject_of(subject_name, dead, sizeof dead)) return BJ_ERR_RANGE;
+
+    subject *s;
+    int e = subject_get(st, dead, 0, &s);
+    if (e) return e;
+
+    uint64_t term;
+    int type;
+    const uint8_t *rec;
+    size_t rlen;
+    e = elog_get(s->log, dlq_index, &term, &type, &rec, &rlen);
+    if (e) return e;
+
+    envelope v;
+    memset(&v, 0, sizeof v);
+    bj_visitor vis = bjm_visitor_noop(&v);
+    vis.on_key = env_key;
+    vis.on_string = env_string;
+    vis.on_binary = env_binary;
+    e = bj_decode(rec, rlen, &vis, NULL);
+    if (e || !v.payload || !bjm_subject_valid(v.subject)) {
+        free(v.payload);
+        return e ? e : BJ_ERR_VERIFY;
+    }
+
+    /* Back to the subject the envelope names, not the one asked for: a
+     * requeue must not be able to move a message between subjects. */
+    e = bjm_publish(st, v.subject, v.payload, (uint32_t)v.plen, new_index);
+    free(v.payload);
+    return e;
 }
 
 /*
@@ -1185,6 +1334,7 @@ int bjm_queues(bjm_store *st, const char *subject,
     bpt_cursor *c = bpt_cursor_open(st->queues, &min, &max);
     if (!c) return BJ_ERR_STATE;
 
+    char dead_name[BJM_SUBJECT_MAX + 1];
     bj_builder *b = st->bld;
     bj_builder_reset(b);
     bj_begin_array(b);
@@ -1231,6 +1381,12 @@ int bjm_queues(bjm_store *st, const char *subject,
         bj_put_int(b, (int64_t)q.max_backoff_ms);
         bj_put_key(b, (const uint8_t *)"dead", 4);
         bj_put_int(b, (int64_t)q.dead_total);
+        bj_put_key(b, (const uint8_t *)"dead_subject", 12);
+        if (dead_subject_of(subject, dead_name, sizeof dead_name))
+            bj_put_string(b, (const uint8_t *)dead_name,
+                          (uint32_t)strlen(dead_name));
+        else
+            bj_put_null(b);
         bj_put_key(b, (const uint8_t *)"dead_indexes", 12);
         bj_begin_array(b);
         for (int i = 0; i < q.ndead; i++) bj_put_int(b, (int64_t)q.dead[i]);

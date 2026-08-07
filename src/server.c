@@ -567,6 +567,61 @@ static void h_fail(http11c_request *req, http11c_response *res) {
     h_job_end(req, res, 0);
 }
 
+static void h_requeue(http11c_request *req, http11c_response *res) {
+    app *a = http11c_req_ctx(req);
+
+    const char *subject = subject_of(req, res, "/requeue/");
+    if (!subject) return;
+
+    uint64_t index = query_u64(req, "index", 0);
+    if (index == 0) {
+        res_err(res, 400, "?index=<n> is required (the index in "
+                          "<subject>.dead, as shown by bjmsg dead)\n");
+        return;
+    }
+
+    /* A dead-letter channel has no channel of its own, so there is
+     * nothing here to requeue from. Say that rather than reporting a
+     * missing index. */
+    size_t slen = strlen(subject), dlen = sizeof BJM_DEAD_SUFFIX - 1;
+    if (slen >= dlen && strcmp(subject + slen - dlen, BJM_DEAD_SUFFIX) == 0) {
+        res_err(res, 400, "that is already a dead-letter channel; requeue "
+                          "names the original subject\n");
+        return;
+    }
+
+    uint64_t at = 0;
+    int e = bjm_requeue(a->store, subject, index, &at);
+    if (e == BJ_ERR_VERIFY) {
+        res_err(res, 422, "that message is not a dead-letter envelope\n");
+        return;
+    }
+    if (e == BJ_ERR_RANGE) {
+        res_err(res, 416, "no such index in the dead-letter channel; "
+                          "bjmsg dead lists them\n");
+        return;
+    }
+    if (e) { res_err(res, status_for(e), "requeue failed\n"); return; }
+
+    bj_builder *b = a->bld;
+    bj_builder_reset(b);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"subject", 7);
+    bj_put_string(b, (const uint8_t *)subject, (uint32_t)strlen(subject));
+    bj_put_key(b, (const uint8_t *)"from_dead_index", 15);
+    bj_put_int(b, (int64_t)index);
+    /* A new index, not the old one: the original is still in the log and
+     * still dead, and reusing its id would be a lie about ordering. */
+    bj_put_key(b, (const uint8_t *)"index", 5);
+    bj_put_int(b, (int64_t)at);
+    bj_end_object(b);
+
+    size_t out_len = 0;
+    const uint8_t *out = bj_builder_data(b, &out_len);
+    if (!out) { res_err(res, 500, "encode failed\n"); return; }
+    res_bj(res, 200, out, out_len);
+}
+
 static void h_queues(http11c_request *req, http11c_response *res) {
     app *a = http11c_req_ctx(req);
 
@@ -768,6 +823,7 @@ static void h_not_found(http11c_request *req, http11c_response *res) {
         "  POST   /take/<subject>?group=&max=&lease=\n"
         "  POST   /done/<subject>?group=&index=\n"
         "  POST   /fail/<subject>?group=&index=[&delay=]\n"
+        "  POST   /requeue/<subject>?index=   (from <subject>.dead)\n"
         "  GET    /queue/<subject>\n"
         "  PUT    /queue/<subject>?group=&lease_ms=&max_attempts=&backoff_ms=\n"
         "  DELETE /queue/<subject>?group=\n"
@@ -815,6 +871,7 @@ int bjm_serve(const char *host, int port, const char *dir) {
     http11c_route(s, "POST", "/take/*", h_take);
     http11c_route(s, "POST", "/done/*", h_done);
     http11c_route(s, "POST", "/fail/*", h_fail);
+    http11c_route(s, "POST", "/requeue/*", h_requeue);
     http11c_route(s, "GET",  "/queue/*", h_queues);
     http11c_route(s, "PUT",  "/queue/*", h_queue_config);
     http11c_route(s, "DELETE", "/queue/*", h_queue_delete);

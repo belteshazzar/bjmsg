@@ -153,6 +153,17 @@ uint64_t bjm_last_index(bjm_store *st, const char *subject);
 #define BJM_DEAD_MAX 64
 #define BJM_MAX_ATTEMPTS_DEFAULT 10
 #define BJM_BACKOFF_DEFAULT_MS 1000
+/*
+ * Where a job goes when it runs out of attempts: an ordinary subject
+ * named "<subject>.dead", so every tool that works on a subject works on
+ * the dead-letter channel too — inspect it, set a retention policy on
+ * it, even consume it with its own queue group.
+ *
+ * The message there is an envelope, { subject, group, index, attempts,
+ * failed_ms, payload }, because the original payload alone does not say
+ * which group gave up on it or how many times it was tried.
+ */
+#define BJM_DEAD_SUFFIX ".dead"
 #define BJM_MAX_BACKOFF_DEFAULT_MS 300000
 
 int bjm_group_valid(const char *s);
@@ -207,6 +218,14 @@ int bjm_queues(bjm_store *st, const char *subject,
  */
 int bjm_queue_floor(bjm_store *st, const char *subject,
                     uint64_t *floor, int *ngroups);
+
+/*
+ * Republish a dead-lettered message back to the subject it came from.
+ * `dlq_index` indexes "<subject>.dead"; the original subject is read from
+ * the envelope rather than assumed. *new_index is where it landed.
+ */
+int bjm_requeue(bjm_store *st, const char *subject, uint64_t dlq_index,
+                uint64_t *new_index);
 
 /* ---- inspection ------------------------------------------------------- */
 
@@ -295,6 +314,8 @@ int bjm_cmd_take(int argc, char **argv);
 int bjm_cmd_done(int argc, char **argv);
 int bjm_cmd_fail(int argc, char **argv);
 int bjm_cmd_work(int argc, char **argv);
+int bjm_cmd_dead(int argc, char **argv);
+int bjm_cmd_requeue(int argc, char **argv);
 
 /* ---- rendering ------------------------------------------------------- */
 

@@ -1213,6 +1213,155 @@ int bjm_cmd_work(int argc, char **argv) {
     return rc ? rc : (failures ? 1 : 0);
 }
 
+/* ---- the dead-letter channel ------------------------------------------- */
+
+/*
+ * A dead-letter envelope, rendered readably. The payload arrives as
+ * BINARY holding the original message, so it decodes one level further
+ * than a plain `sub` of the .dead subject would show.
+ */
+typedef struct {
+    char      key[16];
+    char      group[BJM_GROUP_MAX + 1];
+    long long index, attempts;
+    int       printed;
+} dead_scan;
+
+static void d_key(void *ctx, const uint8_t *k, uint32_t len) {
+    dead_scan *d = ctx;
+    if (len >= sizeof d->key) len = sizeof d->key - 1;
+    memcpy(d->key, k, len);
+    d->key[len] = '\0';
+}
+
+static void d_string(void *ctx, const uint8_t *v, uint32_t len) {
+    dead_scan *d = ctx;
+    if (strcmp(d->key, "group") != 0) return;
+    if (len > BJM_GROUP_MAX) len = BJM_GROUP_MAX;
+    memcpy(d->group, v, len);
+    d->group[len] = '\0';
+}
+
+static void d_int(void *ctx, double v) {
+    dead_scan *d = ctx;
+    if (strcmp(d->key, "index") == 0)         d->index = (long long)v;
+    else if (strcmp(d->key, "attempts") == 0) d->attempts = (long long)v;
+}
+
+/* The envelope itself arrives as the outer batch's BINARY payload; the
+ * original message is the BINARY inside it. */
+static void d_envelope(void *ctx, const uint8_t *bytes, uint32_t len);
+
+typedef struct {
+    char      key[16];
+    long long dlq_index;
+} dead_outer;
+
+static void o_key(void *ctx, const uint8_t *k, uint32_t len) {
+    dead_outer *o = ctx;
+    if (len >= sizeof o->key) len = sizeof o->key - 1;
+    memcpy(o->key, k, len);
+    o->key[len] = '\0';
+}
+
+static void o_int(void *ctx, double v) {
+    dead_outer *o = ctx;
+    if (strcmp(o->key, "index") == 0) o->dlq_index = (long long)v;
+}
+
+static long long g_dlq_index;   /* the entry being printed */
+
+static void d_payload(void *ctx, const uint8_t *bytes, uint32_t len) {
+    dead_scan *d = ctx;
+    if (strcmp(d->key, "payload") != 0 || d->printed) return;
+    printf("%lld\t%s\torig=%lld\tattempts=%lld\t",
+           g_dlq_index, d->group, d->index, d->attempts);
+    if (bjm_render(stdout, bytes, len) != BJ_OK) fputs("<undecodable>", stdout);
+    fputc('\n', stdout);
+    d->printed = 1;
+}
+
+static void d_envelope(void *ctx, const uint8_t *bytes, uint32_t len) {
+    dead_outer *o = ctx;
+    g_dlq_index = o->dlq_index;
+    dead_scan d;
+    memset(&d, 0, sizeof d);
+    bj_visitor v = bjm_visitor_noop(&d);
+    v.on_key = d_key;
+    v.on_string = d_string;
+    v.on_int = d_int;
+    v.on_binary = d_payload;
+    if (bj_decode(bytes, len, &v, NULL) != BJ_OK || !d.printed)
+        printf("%lld\t<not a dead-letter envelope>\n", o->dlq_index);
+}
+
+#define DEAD_USAGE \
+    "usage: bjmsg dead [--url URL] <subject> [--from N]\n" \
+    "\n" \
+    "Show <subject>.dead: jobs a queue group gave up on, one per line as\n" \
+    "  <dead index> <group> orig=<index> attempts=<n> <payload>\n" \
+    "\n" \
+    "Put one back with: bjmsg requeue <subject> --index <dead index>\n"
+
+int bjm_cmd_dead(int argc, char **argv) {
+    query_opts o;
+    int rc = query_parse(argc, argv, &o, DEAD_USAGE);
+    if (rc) return rc == 1 ? 0 : rc;
+    if (!o.subject || !bjm_subject_valid(o.subject)) {
+        fputs(DEAD_USAGE, stderr);
+        return 2;
+    }
+
+    char url[1024];
+    snprintf(url, sizeof url, "%s/sub/%s.dead?from=%llu",
+             o.url_base, o.subject,
+             (unsigned long long)(o.before ? o.before : 1));
+
+    client c;
+    if (client_init(&c, o.retry_ms) != 0) return 1;
+    curl_easy_setopt(c.curl, CURLOPT_HTTPGET, 1L);
+
+    rc = 1;
+    long status = client_perform(&c, url);
+    if (status == 200) {
+        dead_outer outer = {{0}, 0};
+        bj_visitor v = bjm_visitor_noop(&outer);
+        v.on_key = o_key;
+        v.on_int = o_int;
+        v.on_binary = d_envelope;
+        rc = bj_decode(c.body.p, c.body.len, &v, NULL) == BJ_OK ? 0 : 1;
+    } else if (status == 404) {
+        rc = 0;   /* nothing has ever died here */
+    } else if (status > 0) {
+        report_error(&c, status);
+    }
+
+    client_free(&c);
+    return rc;
+}
+
+#define REQUEUE_USAGE \
+    "usage: bjmsg requeue [--url URL] <subject> --index N\n" \
+    "\n" \
+    "Publish a dead-lettered message back to its subject. N is the index\n" \
+    "in <subject>.dead, the first column of `bjmsg dead`. The message is\n" \
+    "appended with a new index; the dead-letter record stays put.\n"
+
+int bjm_cmd_requeue(int argc, char **argv) {
+    query_opts o;
+    int rc = query_parse(argc, argv, &o, REQUEUE_USAGE);
+    if (rc) return rc == 1 ? 0 : rc;
+    if (!o.subject || !bjm_subject_valid(o.subject) || o.index == 0) {
+        fputs(REQUEUE_USAGE, stderr);
+        return 2;
+    }
+
+    char url[1024];
+    snprintf(url, sizeof url, "%s/requeue/%s?index=%llu",
+             o.url_base, o.subject, (unsigned long long)o.index);
+    return query_run(&o, "POST", url);
+}
+
 #define SEEK_USAGE \
     "usage: bjmsg seek [--url URL] <subject> --consumer NAME --index N\n" \
     "\n" \
