@@ -60,7 +60,7 @@ bare `curl` against a broken request is readable.
 
 | route | body / query | response |
 | --- | --- | --- |
-| `POST /pub/<subject>` | one binjson value | `{ subject, index }` |
+| `POST /pub/<subject>` | one binjson value, `?id=` | `{ subject, index, duplicate }` |
 | `GET /sub/<subject>` | `?from=&max=` | ARRAY of `{ index, term, type, payload }` |
 | `GET /sub/<subject>` | `?consumer=&ack=&start=` | same, from the consumer's receipt |
 | `POST /ack/<subject>` | `?consumer=&index=` | `{ subject, consumer, acked }` |
@@ -137,9 +137,55 @@ qualify depends on the request:
   retried, since there was no effect to repeat.
 - **Broke partway** (send/receive error, timeout): retried only for
   requests that are safe to repeat — every `GET`, and `POST /ack`, whose
-  receipt cannot move backwards. **`POST /pub` is not**: the message may
-  already be in the log, and retrying would append it twice. A publish
-  that fails that way is reported rather than silently duplicated.
+  receipt cannot move backwards. A bare `POST /pub` is **not**: the
+  message may already be in the log, and retrying would append it twice,
+  so it is reported rather than silently duplicated. Give it an
+  idempotency key and it becomes retryable like everything else.
+
+## Producer idempotency
+
+A publish carrying an id is deduplicated, so repeating it is free:
+
+```sh
+bjmsg pub orders order-42 --id order-42
+{"subject":"orders","index":7,"duplicate":false}
+bjmsg pub orders order-42 --id order-42
+{"subject":"orders","index":7,"duplicate":true}     # nothing appended
+```
+
+`--auto-id` generates a key for one invocation instead, which makes *that
+publish* safe to retry without you having to invent a key. It is
+deliberately not derived from the payload: two identical messages are
+legitimately two messages.
+
+That is what closes the producer half of effectively-once processing. The
+consumer half you already have for free — indexes are stable and never
+shift, so `(subject, index)` is a permanent dedup key a consumer can
+record atomically with its own output:
+
+```
+BEGIN; insert result; update last_index = 42; COMMIT;   -- skip anything <= 42
+```
+
+Exactly-once *delivery* is not a thing anyone can offer; this is the pair
+of mechanisms that gets you exactly-once *effect*.
+
+### The window
+
+Ids are remembered for `--dedup-window` seconds (default 120), which is
+sized for retries rather than for history. Two generations of the index
+are kept: writes go to the current one, lookups check both, and once a
+window elapses the older is cleared in O(1) — `bpt_reset` truncates an
+append-only file — and becomes the new current.
+
+So an id is remembered for **at least one window and at most two**, with
+bounded space, no per-entry deletions to accumulate, and no compaction to
+schedule. An id found in the older generation is copied forward, so one
+still in active use is not dropped by the next rotation. Which generation
+is current survives a restart.
+
+An id is opaque to the broker: 1–128 printable bytes, no `/` (which
+separates subject from id in the index key).
 
 ## Read receipts: durable subscriptions
 

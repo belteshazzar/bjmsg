@@ -138,11 +138,35 @@ static void h_publish(http11c_request *req, http11c_response *res) {
         return;
     }
 
-    uint64_t index = 0;
-    int e = bjm_publish(a->store, subject, body, (uint32_t)len, &index);
-    if (e) {
-        res_err(res, status_for(e), "publish failed\n");
+    /*
+     * An idempotency key makes this publish safe to repeat: if the id has
+     * been seen inside the dedup window, the original index is returned
+     * and nothing is appended. Look it up before the append, so a retry
+     * of a request that already landed cannot add a second copy.
+     */
+    char id[BJM_DEDUP_ID_MAX + 1];
+    int has_id = http11c_req_query_get(req, "id", id, sizeof id);
+    if (has_id == 1 && !bjm_dedup_id_valid(id)) {
+        res_err(res, 400, "invalid id: 1-128 printable bytes, no '/'\n");
         return;
+    }
+    has_id = has_id == 1;
+
+    uint64_t index = 0;
+    int duplicate = 0;
+    if (has_id) {
+        int e = bjm_dedup_lookup(a->store, subject, id, &duplicate, &index);
+        if (e) { res_err(res, status_for(e), "dedup lookup failed\n"); return; }
+    }
+
+    if (!duplicate) {
+        int e = bjm_publish(a->store, subject, body, (uint32_t)len, &index);
+        if (e) {
+            res_err(res, status_for(e), "publish failed\n");
+            return;
+        }
+        /* After the append, so a failed publish leaves no claim behind. */
+        if (has_id) bjm_dedup_record(a->store, subject, id, index);
     }
 
     bj_builder *b = a->bld;
@@ -152,6 +176,12 @@ static void h_publish(http11c_request *req, http11c_response *res) {
     bj_put_string(b, (const uint8_t *)subject, (uint32_t)strlen(subject));
     bj_put_key(b, (const uint8_t *)"index", 5);
     bj_put_int(b, (int64_t)index);
+    if (has_id) {
+        /* True means "this id was already here" — the caller's retry did
+         * not create a second message. */
+        bj_put_key(b, (const uint8_t *)"duplicate", 9);
+        bj_put_bool(b, duplicate);
+    }
     bj_end_object(b);
 
     size_t out_len = 0;
@@ -804,6 +834,8 @@ static void h_health(http11c_request *req, http11c_response *res) {
     bj_put_int(b, http11c_conn_count(a->srv));
     bj_put_key(b, (const uint8_t *)"uptime_s", 8);
     bj_put_int(b, (int64_t)(time(NULL) - a->started));
+    bj_put_key(b, (const uint8_t *)"dedup_window_ms", 15);
+    bj_put_int(b, (int64_t)bjm_dedup_window(a->store));
     bj_end_object(b);
 
     size_t out_len = 0;
@@ -816,7 +848,7 @@ static void h_not_found(http11c_request *req, http11c_response *res) {
     (void)req;
     res_err(res, 404,
         "no such route. available:\n"
-        "  POST   /pub/<subject>\n"
+        "  POST   /pub/<subject>[?id=]\n"
         "  GET    /sub/<subject>?from=|consumer=\n"
         "  POST   /ack/<subject>?consumer=&index=\n"
         "  POST   /trim/<subject>?before=|keep=[&force=1]\n"
@@ -844,13 +876,15 @@ static void on_signal(int sig) {
     if (g_srv) http11c_stop(g_srv);
 }
 
-int bjm_serve(const char *host, int port, const char *dir) {
+int bjm_serve(const char *host, int port, const char *dir,
+              uint64_t dedup_window_ms) {
     app a = {0};
     a.store = bjm_store_open(dir);
     if (!a.store) {
         fprintf(stderr, "bjmsg: cannot open store at %s\n", dir);
         return 1;
     }
+    if (dedup_window_ms) bjm_dedup_set_window(a.store, dedup_window_ms);
     a.bld = bj_builder_new();
     if (!a.bld) { bjm_store_free(a.store); return 1; }
 

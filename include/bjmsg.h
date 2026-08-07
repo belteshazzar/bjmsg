@@ -121,6 +121,39 @@ int bjm_consumer_stats(bjm_store *st, const char *subject,
 /* Highest index currently in `subject`, or 0 if it does not exist. */
 uint64_t bjm_last_index(bjm_store *st, const char *subject);
 
+/* ---- producer idempotency ---------------------------------------------- */
+
+/*
+ * A publish carrying `?id=` is deduplicated: if that id was published to
+ * the subject recently, the original index is returned and nothing is
+ * appended. That is what makes POST /pub safe to retry — without it a
+ * publish that broke mid-flight might already be in the log, and
+ * retrying would append it twice.
+ *
+ * "Recently" is a bounded window, implemented as two generations of the
+ * dedup index. Writes go to the current one, lookups check both, and
+ * every `window` the older is cleared in O(1) (bpt_reset truncates an
+ * append-only file) and becomes the new current. So an id is remembered
+ * for at least `window` and at most twice that — bounded space with no
+ * deletes to accumulate and no compaction to schedule.
+ */
+#define BJM_DEDUP_ID_MAX 128
+#define BJM_DEDUP_WINDOW_DEFAULT_MS 120000
+
+/* Ids are opaque to the broker; they only may not contain '/', which
+ * separates subject from id in the index key. */
+int bjm_dedup_id_valid(const char *s);
+
+void     bjm_dedup_set_window(bjm_store *st, uint64_t ms);
+uint64_t bjm_dedup_window(const bjm_store *st);
+
+/* *found is 1 when this id was already published, with its index. */
+int bjm_dedup_lookup(bjm_store *st, const char *subject, const char *id,
+                     int *found, uint64_t *index);
+/* Remember `id` as having produced `index`. */
+int bjm_dedup_record(bjm_store *st, const char *subject, const char *id,
+                     uint64_t index);
+
 /* ---- queue groups (competing consumers) -------------------------------- */
 
 /*
@@ -290,7 +323,8 @@ int bjm_trim(bjm_store *st, const char *subject, uint64_t before, int force,
 
 /* ---- server ---------------------------------------------------------- */
 
-int bjm_serve(const char *host, int port, const char *dir);
+int bjm_serve(const char *host, int port, const char *dir,
+              uint64_t dedup_window_ms);
 
 /* ---- clients --------------------------------------------------------- */
 

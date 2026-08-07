@@ -15,6 +15,7 @@
 
 #include <ctype.h>
 #include <signal.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -248,21 +249,44 @@ static int read_all(const char *path, buf *out) {
 
 static void pub_usage(void) {
     fprintf(stderr,
-        "usage: bjmsg pub [--url URL] [--retry MS] <subject>\n"
-        "                 (<text> | --int N | --file PATH)\n"
+        "usage: bjmsg pub [--url URL] [--retry MS] [--id KEY | --auto-id]\n"
+        "                 <subject> (<text> | --int N | --file PATH)\n"
         "\n"
         "  <text>       publish a binjson STRING\n"
         "  --int N      publish a binjson INT\n"
         "  --file PATH  publish PATH's bytes verbatim (already-encoded\n"
         "               binjson); PATH may be - for stdin\n"
+        "  --id KEY     idempotency key. Republishing the same key inside\n"
+        "               the broker's dedup window returns the original\n"
+        "               index instead of appending again.\n"
+        "  --auto-id    generate a key for this invocation, so a retry of\n"
+        "               THIS publish cannot duplicate the message\n"
         "  --retry MS   wait MS between attempts when the broker cannot be\n"
-        "               reached (default 5000; 0 disables retrying)\n");
+        "               reached (default 5000; 0 disables retrying)\n"
+        "\n"
+        "Without an id a publish that breaks mid-flight is reported rather\n"
+        "than retried: it may already be in the log.\n");
+}
+
+/*
+ * An idempotency key for one invocation of `pub`. Only has to be unique
+ * among publishes inside the broker's dedup window, so clock + pid is
+ * enough — and it must NOT be derived from the payload, since two
+ * identical messages are legitimately two messages.
+ */
+static void make_auto_id(char *out, size_t cap) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    snprintf(out, cap, "auto-%llx-%llx-%x",
+             (unsigned long long)ts.tv_sec,
+             (unsigned long long)ts.tv_nsec,
+             (unsigned)getpid());
 }
 
 int bjm_cmd_pub(int argc, char **argv) {
     const char *url_base = DEFAULT_URL;
-    const char *subject = NULL, *text = NULL, *file = NULL;
-    int have_int = 0;
+    const char *subject = NULL, *text = NULL, *file = NULL, *id = NULL;
+    int have_int = 0, auto_id = 0;
     long long int_value = 0;
     long retry_ms = DEFAULT_RETRY_MS;
 
@@ -277,6 +301,10 @@ int bjm_cmd_pub(int argc, char **argv) {
                                 "(0 to disable)\n");
                 return 2;
             }
+        } else if (strcmp(a, "--id") == 0) {
+            if (!(id = arg_value(argc, argv, &i, "--id"))) return 2;
+        } else if (strcmp(a, "--auto-id") == 0) {
+            auto_id = 1;
         } else if (strcmp(a, "--file") == 0) {
             if (!(file = arg_value(argc, argv, &i, "--file"))) return 2;
         } else if (strcmp(a, "--int") == 0) {
@@ -343,15 +371,26 @@ int bjm_cmd_pub(int argc, char **argv) {
     curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, payload.p);
     curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, (long)payload.len);
 
+    char auto_buf[64];
+    if (auto_id && !id) {
+        make_auto_id(auto_buf, sizeof auto_buf);
+        id = auto_buf;
+    }
+
     char url[1024];
-    snprintf(url, sizeof url, "%s/pub/%s", url_base, subject);
+    if (id)
+        snprintf(url, sizeof url, "%s/pub/%s?id=%s", url_base, subject, id);
+    else
+        snprintf(url, sizeof url, "%s/pub/%s", url_base, subject);
 
     int rc = 1;
     /*
-     * Not idempotent: a publish that broke mid-flight may already be in
-     * the log, so only a failure that never reached the broker is retried.
+     * With an id the broker will collapse a repeat, so a publish that
+     * broke mid-flight can be retried like any other request. Without
+     * one it cannot: the message may already be in the log, and retrying
+     * would append a second copy.
      */
-    long status = client_perform_ex(&c, url, 0);
+    long status = client_perform_ex(&c, url, id != NULL);
     if (status == 200) {
         bjm_render(stdout, c.body.p, c.body.len);
         fputc('\n', stdout);

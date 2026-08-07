@@ -23,6 +23,7 @@ static void usage(void) {
         "\n"
         "usage:\n"
         "  bjmsg serve       [--host H] [--port P] [--dir D]\n"
+        "                    [--dedup-window SECONDS]\n"
         "  bjmsg pub         [--url URL] <subject> (<text> | --int N | --file PATH)\n"
         "  bjmsg sub         [--url URL] <subject> [--consumer NAME] [--tail]\n"
         "                    [--from N] [--follow]\n"
@@ -60,6 +61,7 @@ static void usage(void) {
 static int cmd_serve(int argc, char **argv) {
     const char *host = DEFAULT_HOST, *dir = DEFAULT_DIR;
     int port = DEFAULT_PORT;
+    long dedup_window_s = 0;
 
     for (int i = 0; i < argc; i++) {
         const char *a = argv[i];
@@ -67,10 +69,12 @@ static int cmd_serve(int argc, char **argv) {
         if (strcmp(a, "--host") == 0 && !last)      host = argv[++i];
         else if (strcmp(a, "--port") == 0 && !last) port = atoi(argv[++i]);
         else if (strcmp(a, "--dir") == 0 && !last)  dir = argv[++i];
+        else if (strcmp(a, "--dedup-window") == 0 && !last)
+            dedup_window_s = atol(argv[++i]);
         else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) { usage(); return 0; }
         else { fprintf(stderr, "bjmsg: bad argument %s\n", a); return 2; }
     }
-    return bjm_serve(host, port, dir);
+    return bjm_serve(host, port, dir, (uint64_t)dedup_window_s * 1000);
 }
 
 int main(int argc, char **argv) {

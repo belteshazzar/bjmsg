@@ -38,6 +38,8 @@
 #define CURSORS_FILE "_cursors.bpt"
 #define POLICY_FILE  "_policy.bpt"
 #define QUEUES_FILE  "_queues.bpt"
+#define DEDUP_FILE_0 "_dedup0.bpt"
+#define DEDUP_FILE_1 "_dedup1.bpt"
 #define CURSORS_ORDER 64
 
 /*
@@ -82,6 +84,12 @@ struct bjm_store {
     bj_io       queues_io;
     bpt        *queues;   /* opened on first use */
     struct qrec *qscratch; /* one decoded queue record, reused */
+    bj_io       dd_io[2];
+    bpt        *dd[2];     /* two generations of the dedup index */
+    int         dd_gen;    /* which of dd[] is current           */
+    int         dd_open;
+    uint64_t    dd_rotated_ms;
+    uint64_t    dd_window_ms;
 };
 
 /* ---- names ----------------------------------------------------------- */
@@ -108,6 +116,10 @@ int bjm_consumer_valid(const char *s) { return name_valid(s, BJM_CONSUMER_MAX); 
  * path above it. */
 static void mark_publish(bjm_store *st, subject *s, uint64_t index);
 static void marks_prune(bjm_store *st, const char *subject, uint64_t base);
+
+/* Wall-clock milliseconds; defined with the queue machinery that needs it
+ * most, but the dedup window is measured in it too. */
+static uint64_t now_ms(void);
 
 /* ---- open / close ---------------------------------------------------- */
 
@@ -156,6 +168,11 @@ void bjm_store_free(bjm_store *st) {
         bpt_sync(st->queues);
         bpt_free(st->queues);
         st->ns.close(st->ns.ctx, &st->queues_io);
+    }
+    for (int i = 0; i < 2; i++) {
+        if (!st->dd[i]) continue;
+        bpt_free(st->dd[i]);
+        st->ns.close(st->ns.ctx, &st->dd_io[i]);
     }
     free(st->qscratch);
     bj_builder_free(st->bld);
@@ -741,6 +758,227 @@ static void marks_prune(bjm_store *st, const char *subject, uint64_t base) {
     if (keep == m.n) return;
     m.n = keep;
     marks_store(st, subject, &m);
+}
+
+/* ---- producer idempotency ---------------------------------------------- */
+
+int bjm_dedup_id_valid(const char *s) {
+    if (!s) return 0;
+    size_t n = strlen(s);
+    if (n == 0 || n > BJM_DEDUP_ID_MAX) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        /* Opaque apart from the two things that would break the index key
+         * or the log: the separator, and anything unprintable. */
+        if (c == '/' || c < 0x20 || c == 0x7f) return 0;
+    }
+    return 1;
+}
+
+void bjm_dedup_set_window(bjm_store *st, uint64_t ms) { st->dd_window_ms = ms; }
+uint64_t bjm_dedup_window(const bjm_store *st) {
+    return st->dd_window_ms ? st->dd_window_ms : BJM_DEDUP_WINDOW_DEFAULT_MS;
+}
+
+/*
+ * Which generation is current, and when it took over. Kept in the policy
+ * tree because it must outlive a restart and the dedup files themselves
+ * are the thing being cleared. Getting it wrong after a crash would only
+ * clear the newer generation early — correctness is unaffected, since a
+ * lookup checks both, but the window would be shorter than promised.
+ */
+typedef struct { char key[16]; uint64_t gen, rotated_ms; } dd_state;
+
+static void dd_key(void *ctx, const uint8_t *k, uint32_t len) {
+    dd_state *d = ctx;
+    if (len >= sizeof d->key) len = sizeof d->key - 1;
+    memcpy(d->key, k, len);
+    d->key[len] = '\0';
+}
+
+static void dd_int(void *ctx, double v) {
+    dd_state *d = ctx;
+    if (strcmp(d->key, "gen") == 0)             d->gen = (uint64_t)v;
+    else if (strcmp(d->key, "rotated_ms") == 0) d->rotated_ms = (uint64_t)v;
+}
+
+static void dd_state_key(bpt_key *key) {
+    key->is_string = 1;
+    key->num = 0;
+    key->str = (const uint8_t *)"d/state";
+    key->str_len = 7;
+}
+
+static void dd_state_save(bjm_store *st) {
+    if (policy_open(st) != BJ_OK) return;
+    bpt_key key;
+    dd_state_key(&key);
+
+    bj_builder *b = st->cbld;
+    bj_builder_reset(b);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"gen", 3);
+    bj_put_int(b, st->dd_gen);
+    bj_put_key(b, (const uint8_t *)"rotated_ms", 10);
+    bj_put_int(b, (int64_t)st->dd_rotated_ms);
+    bj_end_object(b);
+
+    size_t len = 0;
+    const uint8_t *val = bj_builder_data(b, &len);
+    if (val && bpt_add(st->policy, &key, val, (uint32_t)len) == BJ_OK)
+        bpt_sync(st->policy);
+}
+
+static int dedup_open(bjm_store *st) {
+    if (st->dd_open) return BJ_OK;
+
+    static const char *names[2] = { DEDUP_FILE_0, DEDUP_FILE_1 };
+    for (int i = 0; i < 2; i++) {
+        bj_io io;
+        int e = st->ns.open(st->ns.ctx, names[i], (uint32_t)strlen(names[i]),
+                            BJ_NS_CREATE, &io);
+        if (e) return e;
+        int fresh = io.size(io.ctx) == 0;
+        bpt *t = fresh ? bpt_create(&io, CURSORS_ORDER) : bpt_open(&io);
+        if (!t) { st->ns.close(st->ns.ctx, &io); return BJ_ERR_STATE; }
+        st->dd_io[i] = io;
+        st->dd[i] = t;
+    }
+
+    /* Recover which generation was current. */
+    if (policy_open(st) == BJ_OK) {
+        bpt_key key;
+        dd_state_key(&key);
+        int found = 0;
+        const uint8_t *val = NULL;
+        size_t val_len = 0;
+        if (bpt_search(st->policy, &key, &found, &val, &val_len) == BJ_OK && found) {
+            dd_state d;
+            memset(&d, 0, sizeof d);
+            bj_visitor v = bjm_visitor_noop(&d);
+            v.on_key = dd_key;
+            v.on_int = dd_int;
+            if (bj_decode(val, val_len, &v, NULL) == BJ_OK) {
+                st->dd_gen = d.gen ? 1 : 0;
+                st->dd_rotated_ms = d.rotated_ms;
+            }
+        }
+    }
+    if (st->dd_rotated_ms == 0) {
+        st->dd_rotated_ms = now_ms();
+        st->dd_open = 1;
+        dd_state_save(st);
+        return BJ_OK;
+    }
+    st->dd_open = 1;
+    return BJ_OK;
+}
+
+/*
+ * Retire the older generation once the window has elapsed. bpt_reset
+ * truncates the file and writes a fresh empty tree, so eviction costs
+ * nothing per entry and leaves no deletions to compact away.
+ */
+static void dedup_rotate(bjm_store *st) {
+    uint64_t now = now_ms();
+    uint64_t window = bjm_dedup_window(st);
+    uint64_t elapsed = now - st->dd_rotated_ms;
+    if (elapsed < window) return;
+
+    if (elapsed >= 2 * window) {
+        /*
+         * Rotation is lazy — it only happens when something asks — so a
+         * quiet period can leave both generations older than the window.
+         * Stepping one at a time here would let an id outlive the bound
+         * this promises, by however long the broker was idle.
+         */
+        if (bpt_reset(st->dd[0]) != BJ_OK) return;
+        if (bpt_reset(st->dd[1]) != BJ_OK) return;
+        st->dd_gen = 0;
+    } else {
+        int old = 1 - st->dd_gen;
+        if (bpt_reset(st->dd[old]) != BJ_OK) return;
+        st->dd_gen = old;
+    }
+    st->dd_rotated_ms = now;
+    dd_state_save(st);
+}
+
+static int dedup_key(char *buf, size_t cap, const char *subject,
+                     const char *id, bpt_key *key) {
+    int n = snprintf(buf, cap, "%s/%s", subject, id);
+    if (n < 0 || (size_t)n >= cap) return BJ_ERR_RANGE;
+    key->is_string = 1;
+    key->num = 0;
+    key->str = (const uint8_t *)buf;
+    key->str_len = (uint32_t)n;
+    return BJ_OK;
+}
+
+int bjm_dedup_lookup(bjm_store *st, const char *subject, const char *id,
+                     int *found, uint64_t *index) {
+    *found = 0;
+    *index = 0;
+    int e = dedup_open(st);
+    if (e) return e;
+    dedup_rotate(st);
+
+    char buf[BJM_SUBJECT_MAX + BJM_DEDUP_ID_MAX + 2];
+    bpt_key key;
+    e = dedup_key(buf, sizeof buf, subject, id, &key);
+    if (e) return e;
+
+    /* Current generation first, then the one waiting to be retired. */
+    for (int i = 0; i < 2; i++) {
+        bpt *t = st->dd[i == 0 ? st->dd_gen : 1 - st->dd_gen];
+        const uint8_t *val = NULL;
+        size_t val_len = 0;
+        int hit = 0;
+        e = bpt_search(t, &key, &hit, &val, &val_len);
+        if (e) return e;
+        if (!hit) continue;
+        e = decode_index(val, val_len, index);
+        if (e) return e;
+        *found = 1;
+        /* Seen in the older generation: copy it forward so an id still in
+         * active use is not dropped by the next rotation. */
+        if (i == 1) {
+            bj_builder *b = st->cbld;
+            bj_builder_reset(b);
+            bj_put_int(b, (int64_t)*index);
+            size_t len = 0;
+            const uint8_t *v = bj_builder_data(b, &len);
+            if (v) bpt_add(st->dd[st->dd_gen], &key, v, (uint32_t)len);
+        }
+        return BJ_OK;
+    }
+    return BJ_OK;
+}
+
+int bjm_dedup_record(bjm_store *st, const char *subject, const char *id,
+                     uint64_t index) {
+    int e = dedup_open(st);
+    if (e) return e;
+
+    char buf[BJM_SUBJECT_MAX + BJM_DEDUP_ID_MAX + 2];
+    bpt_key key;
+    e = dedup_key(buf, sizeof buf, subject, id, &key);
+    if (e) return e;
+
+    bj_builder *b = st->cbld;
+    bj_builder_reset(b);
+    bj_put_int(b, (int64_t)index);
+    size_t len = 0;
+    const uint8_t *val = bj_builder_data(b, &len);
+    if (!val) return BJ_ERR_STATE;
+
+    /*
+     * Not fsynced. A crash between the publish and this record leaves the
+     * message durable but the id forgotten, so a retry would duplicate —
+     * the same narrow gap that exists between any append and its index,
+     * and much smaller than the failure this is protecting against.
+     */
+    return bpt_add(st->dd[st->dd_gen], &key, val, (uint32_t)len);
 }
 
 /* ---- queue groups ------------------------------------------------------ */
