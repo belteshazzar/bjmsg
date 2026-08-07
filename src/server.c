@@ -520,9 +520,14 @@ static void h_job_end(http11c_request *req, http11c_response *res, int done) {
         return;
     }
 
+    /* Absent ?delay= means "use the group's backoff policy". */
+    uint64_t delay = query_u64(req, "delay", UINT64_MAX);
+
     int found = 0;
+    uint64_t retry_in = 0;
     int e = done ? bjm_done(a->store, subject, group, index, &found)
-                 : bjm_fail(a->store, subject, group, index, &found);
+                 : bjm_fail(a->store, subject, group, index, delay,
+                            &found, &retry_in);
     if (e) { res_err(res, status_for(e), "queue update failed\n"); return; }
 
     bj_builder *b = a->bld;
@@ -542,6 +547,10 @@ static void h_job_end(http11c_request *req, http11c_response *res, int done) {
      */
     bj_put_key(b, (const uint8_t *)"held", 4);
     bj_put_bool(b, found);
+    if (!done) {
+        bj_put_key(b, (const uint8_t *)"retry_in_ms", 11);
+        bj_put_int(b, (int64_t)retry_in);
+    }
     bj_end_object(b);
 
     size_t out_len = 0;
@@ -580,7 +589,11 @@ static void h_queue_config(http11c_request *req, http11c_response *res) {
 
     uint64_t lease = query_u64(req, "lease_ms", BJM_LEASE_DEFAULT_MS);
     uint64_t attempts = query_u64(req, "max_attempts", BJM_MAX_ATTEMPTS_DEFAULT);
-    int e = bjm_queue_config(a->store, subject, group, lease, attempts);
+    uint64_t backoff = query_u64(req, "backoff_ms", BJM_BACKOFF_DEFAULT_MS);
+    uint64_t max_backoff = query_u64(req, "max_backoff_ms",
+                                     BJM_MAX_BACKOFF_DEFAULT_MS);
+    int e = bjm_queue_config(a->store, subject, group, lease, attempts,
+                             backoff, max_backoff);
     if (e) { res_err(res, status_for(e), "queue config failed\n"); return; }
     h_queues(req, res);
 }
@@ -754,9 +767,9 @@ static void h_not_found(http11c_request *req, http11c_response *res) {
         "  POST   /trim/<subject>?before=|keep=[&force=1]\n"
         "  POST   /take/<subject>?group=&max=&lease=\n"
         "  POST   /done/<subject>?group=&index=\n"
-        "  POST   /fail/<subject>?group=&index=\n"
+        "  POST   /fail/<subject>?group=&index=[&delay=]\n"
         "  GET    /queue/<subject>\n"
-        "  PUT    /queue/<subject>?group=&lease_ms=&max_attempts=\n"
+        "  PUT    /queue/<subject>?group=&lease_ms=&max_attempts=&backoff_ms=\n"
         "  DELETE /queue/<subject>?group=\n"
         "  GET    /consumers/<subject>\n"
         "  DELETE /consumers/<subject>?consumer=\n"

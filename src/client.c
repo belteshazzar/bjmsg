@@ -631,7 +631,9 @@ typedef struct {
     uint64_t    max_age, max_messages, max_bytes;
     uint64_t    lease_ms;
     uint64_t    max_attempts;
+    uint64_t    backoff_ms, max_backoff_ms, delay_ms;
     int         have_lease, have_attempts;
+    int         have_backoff, have_max_backoff, have_delay;
     int         max;
     long        retry_ms, interval_ms;
     int         force, clear, del, ignore_consumers;
@@ -697,6 +699,34 @@ static int query_parse(int argc, char **argv, query_opts *o, const char *usage) 
             }
             o->lease_ms = secs * 1000;
             o->have_lease = 1;
+        } else if (strcmp(a, "--backoff") == 0) {
+            const char *v = arg_value(argc, argv, &i, "--backoff");
+            uint64_t secs;
+            if (!v || parse_duration(v, &secs) != 0) {
+                fprintf(stderr, "bjmsg: --backoff wants a duration like "
+                                "1s, 30s, or 0 to retry instantly\n");
+                return 2;
+            }
+            o->backoff_ms = secs * 1000;
+            o->have_backoff = 1;
+        } else if (strcmp(a, "--max-backoff") == 0) {
+            const char *v = arg_value(argc, argv, &i, "--max-backoff");
+            uint64_t secs;
+            if (!v || parse_duration(v, &secs) != 0) {
+                fprintf(stderr, "bjmsg: --max-backoff wants a duration\n");
+                return 2;
+            }
+            o->max_backoff_ms = secs * 1000;
+            o->have_max_backoff = 1;
+        } else if (strcmp(a, "--delay") == 0) {
+            const char *v = arg_value(argc, argv, &i, "--delay");
+            uint64_t secs;
+            if (!v || parse_duration(v, &secs) != 0) {
+                fprintf(stderr, "bjmsg: --delay wants a duration like 30s\n");
+                return 2;
+            }
+            o->delay_ms = secs * 1000;
+            o->have_delay = 1;
         } else if (strcmp(a, "--max-attempts") == 0) {
             const char *v = arg_value(argc, argv, &i, "--max-attempts");
             if (!v) return 2;
@@ -912,6 +942,9 @@ int bjm_cmd_policy(int argc, char **argv) {
     "  --max-attempts N  give up on a job after N deliveries and count it\n" \
     "                 dead (default 10). 0 retries forever, which lets one\n" \
     "                 always-failing job starve the queue.\n" \
+    "  --backoff D    base wait before a failed job is offered again; it\n" \
+    "                 doubles with each attempt (default 1s, 0 = instant)\n" \
+    "  --max-backoff D  ceiling on that doubling (default 5m)\n" \
     "  --delete       forget the group\n"
 
 int bjm_cmd_queue(int argc, char **argv) {
@@ -935,12 +968,18 @@ int bjm_cmd_queue(int argc, char **argv) {
         return query_run(&o, "DELETE", url);
     }
     snprintf(url, sizeof url,
-             "%s/queue/%s?group=%s&lease_ms=%llu&max_attempts=%llu",
+             "%s/queue/%s?group=%s&lease_ms=%llu&max_attempts=%llu"
+             "&backoff_ms=%llu&max_backoff_ms=%llu",
              o.url_base, o.subject, o.group,
              (unsigned long long)(o.have_lease ? o.lease_ms
                                                : BJM_LEASE_DEFAULT_MS),
              (unsigned long long)(o.have_attempts ? o.max_attempts
-                                                  : BJM_MAX_ATTEMPTS_DEFAULT));
+                                                  : BJM_MAX_ATTEMPTS_DEFAULT),
+             (unsigned long long)(o.have_backoff ? o.backoff_ms
+                                                 : BJM_BACKOFF_DEFAULT_MS),
+             (unsigned long long)(o.have_max_backoff
+                                      ? o.max_backoff_ms
+                                      : BJM_MAX_BACKOFF_DEFAULT_MS));
     return query_run(&o, "PUT", url);
 }
 
@@ -998,7 +1037,10 @@ int bjm_cmd_take(int argc, char **argv) {
 }
 
 #define JOBEND_USAGE(verb) \
-    "usage: bjmsg " verb " [--url URL] <subject> --group G --index N\n"
+    "usage: bjmsg " verb " [--url URL] <subject> --group G --index N\n" \
+    "                 [--delay D]\n" \
+    "\n" \
+    "--delay overrides the group's backoff for this one job.\n"
 
 static int job_end(int argc, char **argv, const char *verb, const char *usage) {
     query_opts o;
@@ -1011,9 +1053,13 @@ static int job_end(int argc, char **argv, const char *verb, const char *usage) {
     }
 
     char url[1024];
-    snprintf(url, sizeof url, "%s/%s/%s?group=%s&index=%llu",
-             o.url_base, verb, o.subject, o.group,
-             (unsigned long long)o.index);
+    int n = snprintf(url, sizeof url, "%s/%s/%s?group=%s&index=%llu",
+                     o.url_base, verb, o.subject, o.group,
+                     (unsigned long long)o.index);
+    /* Without --delay the broker applies the group's backoff policy. */
+    if (o.have_delay && n > 0 && (size_t)n < sizeof url)
+        snprintf(url + n, sizeof url - n, "&delay=%llu",
+                 (unsigned long long)o.delay_ms);
     return query_run(&o, "POST", url);
 }
 
@@ -1157,13 +1203,10 @@ int bjm_cmd_work(int argc, char **argv) {
 
         printf("%lld\t%s\n", j.index, ok ? "done" : "failed");
         fflush(stdout);
-        if (!ok) {
-            failures++;
-            /* A failed job is due again immediately, and this worker is
-             * the one most likely to ask next — pause so it does not spin
-             * on the job it just failed. */
-            sleep_ms(idle);
-        }
+        /* No pause here: the broker's backoff already withholds the job
+         * this worker just failed, so there is nothing to spin on, and
+         * sleeping would only delay the *other* jobs waiting behind it. */
+        if (!ok) failures++;
     }
 
     client_free(&c);

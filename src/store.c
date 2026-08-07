@@ -754,6 +754,8 @@ typedef struct qrec {
     uint64_t next;
     uint64_t lease_ms;
     uint64_t max_attempts;      /* 0 = retry forever */
+    uint64_t backoff_ms;        /* base retry delay; 0 = retry instantly */
+    uint64_t max_backoff_ms;    /* ceiling on the doubling */
     uint64_t fl[BJM_INFLIGHT_MAX * 3];
     int      nfl;               /* uint64s used, so entries = nfl/3 */
     uint64_t dead_total;        /* jobs that exhausted their attempts */
@@ -837,6 +839,10 @@ static void q_int(void *ctx, double v) {
         q->max_attempts = (uint64_t)v;
     } else if (strcmp(q->key, "dead_total") == 0) {
         q->dead_total = (uint64_t)v;
+    } else if (strcmp(q->key, "backoff_ms") == 0) {
+        q->backoff_ms = (uint64_t)v;
+    } else if (strcmp(q->key, "max_backoff_ms") == 0) {
+        q->max_backoff_ms = (uint64_t)v;
     }
 }
 
@@ -881,6 +887,8 @@ static int queue_load(bjm_store *st, const char *subject_name, const char *group
     q->next = (e == BJ_OK) ? elog_base_index(s->log) + 1 : 1;
     q->lease_ms = BJM_LEASE_DEFAULT_MS;
     q->max_attempts = BJM_MAX_ATTEMPTS_DEFAULT;
+    q->backoff_ms = BJM_BACKOFF_DEFAULT_MS;
+    q->max_backoff_ms = BJM_MAX_BACKOFF_DEFAULT_MS;
     return BJ_OK;
 }
 
@@ -902,6 +910,10 @@ static int queue_store(bjm_store *st, const char *subject, const char *group,
     bj_put_int(b, (int64_t)q->max_attempts);
     bj_put_key(b, (const uint8_t *)"dead_total", 10);
     bj_put_int(b, (int64_t)q->dead_total);
+    bj_put_key(b, (const uint8_t *)"backoff_ms", 10);
+    bj_put_int(b, (int64_t)q->backoff_ms);
+    bj_put_key(b, (const uint8_t *)"max_backoff_ms", 14);
+    bj_put_int(b, (int64_t)q->max_backoff_ms);
     bj_put_key(b, (const uint8_t *)"inflight", 8);
     bj_begin_array(b);
     for (int i = 0; i < q->nfl; i++) bj_put_int(b, (int64_t)q->fl[i]);
@@ -1043,9 +1055,27 @@ int bjm_take(bjm_store *st, const char *subject_name, const char *group,
     return *out ? BJ_OK : BJ_ERR_STATE;
 }
 
+/*
+ * The wait before a failed job is offered again: the group's base delay
+ * doubled once per attempt so far, capped. The shift is bounded because a
+ * group with max_attempts == 0 retries forever and would otherwise shift
+ * past the width of the type.
+ */
+static uint64_t backoff_for(const qrec *q, uint64_t attempts) {
+    if (q->backoff_ms == 0) return 0;
+    unsigned shift = attempts > 0 ? (unsigned)(attempts - 1) : 0;
+    if (shift > 30) shift = 30;
+    uint64_t d = q->backoff_ms << shift;
+    if (d < q->backoff_ms) d = q->max_backoff_ms;       /* overflowed */
+    if (q->max_backoff_ms && d > q->max_backoff_ms) d = q->max_backoff_ms;
+    return d;
+}
+
 static int queue_release(bjm_store *st, const char *subject, const char *group,
-                         uint64_t index, int drop, int *found) {
+                         uint64_t index, int drop, uint64_t delay_ms,
+                         int *found, uint64_t *retry_in_ms) {
     *found = 0;
+    if (retry_in_ms) *retry_in_ms = 0;
     int e = queues_open(st);
     if (e) return e;
 
@@ -1057,8 +1087,15 @@ static int queue_release(bjm_store *st, const char *subject, const char *group,
     int at = fl_find(q, index);
     if (at < 0) return BJ_OK;      /* never leased, or already finished */
 
-    if (drop) fl_remove(q, at);
-    else      FL_EXPIRES(q, at) = 0;   /* due now; the next take picks it up */
+    if (drop) {
+        fl_remove(q, at);
+    } else {
+        uint64_t d = delay_ms == UINT64_MAX
+            ? backoff_for(q, FL_ATTEMPTS(q, at))
+            : delay_ms;
+        FL_EXPIRES(q, at) = now_ms() + d;
+        if (retry_in_ms) *retry_in_ms = d;
+    }
 
     *found = 1;
     return queue_store(st, subject, group, q);
@@ -1066,16 +1103,19 @@ static int queue_release(bjm_store *st, const char *subject, const char *group,
 
 int bjm_done(bjm_store *st, const char *subject, const char *group,
              uint64_t index, int *found) {
-    return queue_release(st, subject, group, index, 1, found);
+    return queue_release(st, subject, group, index, 1, 0, found, NULL);
 }
 
 int bjm_fail(bjm_store *st, const char *subject, const char *group,
-             uint64_t index, int *found) {
-    return queue_release(st, subject, group, index, 0, found);
+             uint64_t index, uint64_t delay_ms, int *found,
+             uint64_t *retry_in_ms) {
+    return queue_release(st, subject, group, index, 0, delay_ms,
+                         found, retry_in_ms);
 }
 
 int bjm_queue_config(bjm_store *st, const char *subject, const char *group,
-                     uint64_t lease_ms, uint64_t max_attempts) {
+                     uint64_t lease_ms, uint64_t max_attempts,
+                     uint64_t backoff_ms, uint64_t max_backoff_ms) {
     int e = queues_open(st);
     if (e) return e;
 
@@ -1085,6 +1125,8 @@ int bjm_queue_config(bjm_store *st, const char *subject, const char *group,
     if (e) return e;
     q->lease_ms = lease_ms;
     q->max_attempts = max_attempts;
+    q->backoff_ms = backoff_ms;
+    q->max_backoff_ms = max_backoff_ms;
 
     e = queue_store(st, subject, group, q);
     if (e) return e;
@@ -1183,6 +1225,10 @@ int bjm_queues(bjm_store *st, const char *subject,
         bj_put_int(b, (int64_t)q.lease_ms);
         bj_put_key(b, (const uint8_t *)"max_attempts", 12);
         bj_put_int(b, (int64_t)q.max_attempts);
+        bj_put_key(b, (const uint8_t *)"backoff_ms", 10);
+        bj_put_int(b, (int64_t)q.backoff_ms);
+        bj_put_key(b, (const uint8_t *)"max_backoff_ms", 14);
+        bj_put_int(b, (int64_t)q.max_backoff_ms);
         bj_put_key(b, (const uint8_t *)"dead", 4);
         bj_put_int(b, (int64_t)q.dead_total);
         bj_put_key(b, (const uint8_t *)"dead_indexes", 12);

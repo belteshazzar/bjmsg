@@ -152,6 +152,8 @@ uint64_t bjm_last_index(bjm_store *st, const char *subject);
 #define BJM_LEASE_DEFAULT_MS 30000
 #define BJM_DEAD_MAX 64
 #define BJM_MAX_ATTEMPTS_DEFAULT 10
+#define BJM_BACKOFF_DEFAULT_MS 1000
+#define BJM_MAX_BACKOFF_DEFAULT_MS 300000
 
 int bjm_group_valid(const char *s);
 
@@ -169,9 +171,20 @@ int bjm_take(bjm_store *st, const char *subject, const char *group,
  * leased (an expired-and-retaken job, or a bad index). */
 int bjm_done(bjm_store *st, const char *subject, const char *group,
              uint64_t index, int *found);
-/* Give a job back now rather than waiting for its lease to expire. */
+/*
+ * Give a job back rather than waiting for its lease to expire. It becomes
+ * available again after a delay: `delay_ms` if given, or UINT64_MAX to
+ * use the group's backoff policy, which doubles the wait with each
+ * attempt. *retry_in_ms reports what was applied.
+ *
+ * Some delay is the point. A job failed with no delay is due instantly,
+ * and the worker that just failed it is the one most likely to ask next
+ * — so it takes the same job straight back, and a permanently-failing
+ * job spins as fast as the network allows instead of retrying.
+ */
 int bjm_fail(bjm_store *st, const char *subject, const char *group,
-             uint64_t index, int *found);
+             uint64_t index, uint64_t delay_ms, int *found,
+             uint64_t *retry_in_ms);
 
 /*
  * `max_attempts` bounds redelivery: a job that has been handed out that
@@ -180,7 +193,8 @@ int bjm_fail(bjm_store *st, const char *subject, const char *group,
  * permanently-failing job starve the queue.
  */
 int bjm_queue_config(bjm_store *st, const char *subject, const char *group,
-                     uint64_t lease_ms, uint64_t max_attempts);
+                     uint64_t lease_ms, uint64_t max_attempts,
+                     uint64_t backoff_ms, uint64_t max_backoff_ms);
 int bjm_queue_delete(bjm_store *st, const char *subject, const char *group,
                      int *deleted);
 int bjm_queues(bjm_store *st, const char *subject,

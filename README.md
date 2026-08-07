@@ -67,9 +67,9 @@ bare `curl` against a broken request is readable.
 | `POST /trim/<subject>` | `?before=` or `?keep=` `[&force=1]` | `{ subject, removed, base, last }` |
 | `POST /take/<subject>` | `?group=&max=&lease=` | ARRAY of `{ index, attempts, expires_ms, payload }` |
 | `POST /done/<subject>` | `?group=&index=` | `{ subject, group, index, held }` |
-| `POST /fail/<subject>` | `?group=&index=` | same |
+| `POST /fail/<subject>` | `?group=&index=[&delay=]` | `{ …, held, retry_in_ms }` |
 | `GET /queue/<subject>` | | ARRAY of group states |
-| `PUT /queue/<subject>` | `?group=&lease_ms=&max_attempts=` | the stored groups |
+| `PUT /queue/<subject>` | `?group=&lease_ms=&max_attempts=&backoff_ms=&max_backoff_ms=` | the stored groups |
 | `DELETE /queue/<subject>` | `?group=` | `{ subject, group, deleted }` |
 | `GET /policy/<subject>` | | the subject's retention policy |
 | `PUT /policy/<subject>` | `?max_age_s=&max_messages=&max_bytes=&ignore_consumers=` | the stored policy |
@@ -235,16 +235,30 @@ plainly: the broker cannot tell a dead worker from a slow one, so a slow
 job is run twice. Jobs must be idempotent. `BJMSG_ATTEMPTS` above 1 is a
 handler's warning that it is seeing a job again.
 
-`--max-attempts` (default 10) bounds that. A job delivered that many times
-without finishing is dropped and counted as dead rather than handed out
-forever — without it, one permanently-failing job is redelivered as fast
-as workers can ask for it and starves everything else:
+A failed job does not come straight back. It waits `--backoff` (default
+1s), **doubling with each attempt** up to `--max-backoff` (default 5m):
+
+```sh
+bjmsg queue jobs --group workers --backoff 1s --max-backoff 5m
+bjmsg fail jobs --group workers --index 42 --delay 30s   # override for one job
+```
+
+Some delay is essential, not a nicety. A job failed with no delay is due
+instantly, and the worker that just failed it is the one most likely to
+ask next — so it takes the same job straight back and a failing job spins
+as fast as the network allows. With backoff, the retries spread out and
+other jobs keep flowing past. `--backoff 0` restores instant retry.
+
+`--max-attempts` (default 10) is the other half. A job delivered that many
+times without finishing is dropped and counted as dead rather than retried
+forever:
 
 ```sh
 bjmsg queue jobs --group workers --lease 30s --max-attempts 3
 bjmsg queue jobs
 [{"group":"workers","next":7,"pending":0,"inflight":0,"expired":0,
-  "lease_ms":2000,"max_attempts":3,"dead":1,"dead_indexes":[4]}]
+  "lease_ms":30000,"max_attempts":4,"backoff_ms":1000,
+  "max_backoff_ms":300000,"dead":1,"dead_indexes":[4]}]
 ```
 
 `--lease 0` opts out of the whole mechanism: jobs are taken and forgotten,
