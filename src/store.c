@@ -37,6 +37,7 @@
  * but they always end in .elog, and bjm_subjects filters on that). */
 #define CURSORS_FILE "_cursors.bpt"
 #define POLICY_FILE  "_policy.bpt"
+#define QUEUES_FILE  "_queues.bpt"
 #define CURSORS_ORDER 64
 
 /*
@@ -77,6 +78,9 @@ struct bjm_store {
     bpt        *cursors;  /* opened on first use */
     bj_io       policy_io;
     bpt        *policy;   /* opened on first use */
+    bj_io       queues_io;
+    bpt        *queues;   /* opened on first use */
+    struct qrec *qscratch; /* one decoded queue record, reused */
 };
 
 /* ---- names ----------------------------------------------------------- */
@@ -145,6 +149,12 @@ void bjm_store_free(bjm_store *st) {
         bpt_free(st->policy);
         st->ns.close(st->ns.ctx, &st->policy_io);
     }
+    if (st->queues) {
+        bpt_sync(st->queues);
+        bpt_free(st->queues);
+        st->ns.close(st->ns.ctx, &st->queues_io);
+    }
+    free(st->qscratch);
     bj_builder_free(st->bld);
     bj_builder_free(st->cbld);
     bjns_posix_free(&st->ns);
@@ -729,6 +739,512 @@ static void marks_prune(bjm_store *st, const char *subject, uint64_t base) {
     marks_store(st, subject, &m);
 }
 
+/* ---- queue groups ------------------------------------------------------ */
+
+int bjm_group_valid(const char *s) { return name_valid(s, BJM_GROUP_MAX); }
+
+/*
+ * One group's persisted state. `fl` is the inflight table flattened as
+ * (index, expires_ms, attempts) triples — the same shape as the retention
+ * marks, and for the same reason: it decodes with one integer callback
+ * and the table is small enough that rewriting it whole is cheaper than
+ * maintaining a record per entry.
+ */
+typedef struct qrec {
+    uint64_t next;
+    uint64_t lease_ms;
+    uint64_t max_attempts;      /* 0 = retry forever */
+    uint64_t fl[BJM_INFLIGHT_MAX * 3];
+    int      nfl;               /* uint64s used, so entries = nfl/3 */
+    uint64_t dead_total;        /* jobs that exhausted their attempts */
+    uint64_t dead[BJM_DEAD_MAX];/* the most recent of them */
+    int      ndead;
+    /* decode scratch */
+    char     key[32];
+    int      in_array;          /* 0 none, 1 inflight, 2 dead */
+} qrec;
+
+#define FL_INDEX(q, i)   ((q)->fl[(i) * 3])
+#define FL_EXPIRES(q, i) ((q)->fl[(i) * 3 + 1])
+#define FL_ATTEMPTS(q, i) ((q)->fl[(i) * 3 + 2])
+#define FL_COUNT(q)      ((q)->nfl / 3)
+
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+static int queues_open(bjm_store *st) {
+    if (st->queues) return BJ_OK;
+
+    bj_io io;
+    int e = st->ns.open(st->ns.ctx, QUEUES_FILE, sizeof QUEUES_FILE - 1,
+                        BJ_NS_CREATE, &io);
+    if (e) return e;
+
+    int fresh = io.size(io.ctx) == 0;
+    bpt *t = fresh ? bpt_create(&io, CURSORS_ORDER) : bpt_open(&io);
+    if (!t) { st->ns.close(st->ns.ctx, &io); return BJ_ERR_STATE; }
+    if (fresh) st->ns.sync(st->ns.ctx);
+
+    if (!st->qscratch) {
+        st->qscratch = calloc(1, sizeof *st->qscratch);
+        if (!st->qscratch) {
+            bpt_free(t);
+            st->ns.close(st->ns.ctx, &io);
+            return BJ_ERR_OOM;
+        }
+    }
+    st->queues_io = io;
+    st->queues = t;
+    return BJ_OK;
+}
+
+/* "<subject>/<group>", same unambiguous shape as a consumer key. */
+static int queue_key(char *buf, size_t cap, const char *subject,
+                     const char *group, bpt_key *key) {
+    int n = snprintf(buf, cap, "%s/%s", subject, group ? group : "");
+    if (n < 0 || (size_t)n >= cap) return BJ_ERR_RANGE;
+    key->is_string = 1;
+    key->num = 0;
+    key->str = (const uint8_t *)buf;
+    key->str_len = (uint32_t)n;
+    return BJ_OK;
+}
+
+static void q_key(void *ctx, const uint8_t *k, uint32_t len) {
+    qrec *q = ctx;
+    if (len >= sizeof q->key) len = sizeof q->key - 1;
+    memcpy(q->key, k, len);
+    q->key[len] = '\0';
+    q->in_array = strcmp(q->key, "inflight") == 0 ? 1
+                : strcmp(q->key, "dead") == 0     ? 2 : 0;
+}
+
+static void q_int(void *ctx, double v) {
+    qrec *q = ctx;
+    if (q->in_array == 1) {
+        if (q->nfl < (int)(sizeof q->fl / sizeof q->fl[0]))
+            q->fl[q->nfl++] = (uint64_t)v;
+    } else if (q->in_array == 2) {
+        if (q->ndead < BJM_DEAD_MAX) q->dead[q->ndead++] = (uint64_t)v;
+    } else if (strcmp(q->key, "next") == 0) {
+        q->next = (uint64_t)v;
+    } else if (strcmp(q->key, "lease_ms") == 0) {
+        q->lease_ms = (uint64_t)v;
+    } else if (strcmp(q->key, "max_attempts") == 0) {
+        q->max_attempts = (uint64_t)v;
+    } else if (strcmp(q->key, "dead_total") == 0) {
+        q->dead_total = (uint64_t)v;
+    }
+}
+
+static void q_array_end(void *ctx) { ((qrec *)ctx)->in_array = 0; }
+
+/*
+ * Load a group's record, or invent a fresh one. A new group starts at the
+ * oldest surviving message: a job queue exists to run the backlog.
+ */
+static int queue_load(bjm_store *st, const char *subject_name, const char *group,
+                      qrec *q, int *existed) {
+    memset(q, 0, sizeof *q);
+    *existed = 0;
+
+    char buf[BJM_SUBJECT_MAX + BJM_GROUP_MAX + 2];
+    bpt_key key;
+    int e = queue_key(buf, sizeof buf, subject_name, group, &key);
+    if (e) return e;
+
+    int found = 0;
+    const uint8_t *val = NULL;
+    size_t val_len = 0;
+    e = bpt_search(st->queues, &key, &found, &val, &val_len);
+    if (e) return e;
+
+    if (found) {
+        bj_visitor v = bjm_visitor_noop(q);
+        v.on_key = q_key;
+        v.on_int = q_int;
+        v.on_array_end = q_array_end;
+        e = bj_decode(val, val_len, &v, NULL);
+        if (e) return e;
+        *existed = 1;
+        /* nfl must stay a whole number of triples even if the record was
+         * truncated by a smaller BJM_INFLIGHT_MAX in an older binary. */
+        q->nfl -= q->nfl % 3;
+        return BJ_OK;
+    }
+
+    subject *s;
+    e = subject_get(st, subject_name, 0, &s);
+    q->next = (e == BJ_OK) ? elog_base_index(s->log) + 1 : 1;
+    q->lease_ms = BJM_LEASE_DEFAULT_MS;
+    q->max_attempts = BJM_MAX_ATTEMPTS_DEFAULT;
+    return BJ_OK;
+}
+
+static int queue_store(bjm_store *st, const char *subject, const char *group,
+                       const qrec *q) {
+    char buf[BJM_SUBJECT_MAX + BJM_GROUP_MAX + 2];
+    bpt_key key;
+    int e = queue_key(buf, sizeof buf, subject, group, &key);
+    if (e) return e;
+
+    bj_builder *b = st->cbld;
+    bj_builder_reset(b);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"next", 4);
+    bj_put_int(b, (int64_t)q->next);
+    bj_put_key(b, (const uint8_t *)"lease_ms", 8);
+    bj_put_int(b, (int64_t)q->lease_ms);
+    bj_put_key(b, (const uint8_t *)"max_attempts", 12);
+    bj_put_int(b, (int64_t)q->max_attempts);
+    bj_put_key(b, (const uint8_t *)"dead_total", 10);
+    bj_put_int(b, (int64_t)q->dead_total);
+    bj_put_key(b, (const uint8_t *)"inflight", 8);
+    bj_begin_array(b);
+    for (int i = 0; i < q->nfl; i++) bj_put_int(b, (int64_t)q->fl[i]);
+    bj_end_array(b);
+    bj_put_key(b, (const uint8_t *)"dead", 4);
+    bj_begin_array(b);
+    for (int i = 0; i < q->ndead; i++) bj_put_int(b, (int64_t)q->dead[i]);
+    bj_end_array(b);
+    bj_end_object(b);
+
+    size_t len = 0;
+    const uint8_t *val = bj_builder_data(b, &len);
+    if (!val) return BJ_ERR_STATE;
+    return bpt_add(st->queues, &key, val, (uint32_t)len);
+}
+
+static void fl_remove(qrec *q, int entry) {
+    int last = FL_COUNT(q) - 1;
+    if (entry != last)
+        memcpy(&q->fl[entry * 3], &q->fl[last * 3], 3 * sizeof q->fl[0]);
+    q->nfl -= 3;
+}
+
+static int fl_find(const qrec *q, uint64_t index) {
+    for (int i = 0; i < FL_COUNT(q); i++)
+        if (FL_INDEX(q, i) == index) return i;
+    return -1;
+}
+
+int bjm_take(bjm_store *st, const char *subject_name, const char *group,
+             int max, uint64_t lease_ms, int *count,
+             const uint8_t **out, size_t *out_len) {
+    *count = 0;
+    int e = queues_open(st);
+    if (e) return e;
+
+    subject *s;
+    e = subject_get(st, subject_name, 0, &s);
+    if (e) return e;
+    uint64_t last = elog_last_index(s->log);
+
+    qrec *q = st->qscratch;
+    int existed = 0;
+    e = queue_load(st, subject_name, group, q, &existed);
+    if (e) return e;
+    if (lease_ms == UINT64_MAX) lease_ms = q->lease_ms;   /* caller said "default" */
+    else q->lease_ms = lease_ms;
+
+    if (max < 1) max = 1;
+    if (max > BJM_INFLIGHT_MAX) max = BJM_INFLIGHT_MAX;
+
+    uint64_t now = now_ms();
+    uint64_t chosen[BJM_INFLIGHT_MAX];
+    uint64_t attempts[BJM_INFLIGHT_MAX];
+    int n = 0;
+
+    /*
+     * Expired leases first. A job whose worker died is older work than
+     * anything still untouched, and redelivering it before handing out
+     * new jobs keeps a failing job from being starved behind the queue.
+     */
+    for (int i = 0; i < FL_COUNT(q) && n < max; i++) {
+        if (FL_EXPIRES(q, i) > now) continue;
+        /*
+         * A job that has used up its attempts stops coming back. Without
+         * this a job that always fails is redelivered as fast as workers
+         * can ask for it, starving every other job in the queue — the
+         * failure mode is a hot loop, not a slow leak.
+         */
+        if (q->max_attempts && FL_ATTEMPTS(q, i) >= q->max_attempts) {
+            uint64_t dead_index = FL_INDEX(q, i);
+            q->dead_total++;
+            if (q->ndead == BJM_DEAD_MAX) {
+                memmove(q->dead, q->dead + 1,
+                        (BJM_DEAD_MAX - 1) * sizeof q->dead[0]);
+                q->ndead--;
+            }
+            q->dead[q->ndead++] = dead_index;
+            fl_remove(q, i);
+            i--;                     /* fl_remove moved another entry here */
+            continue;
+        }
+        FL_ATTEMPTS(q, i)++;
+        FL_EXPIRES(q, i) = now + lease_ms;
+        chosen[n] = FL_INDEX(q, i);
+        attempts[n] = FL_ATTEMPTS(q, i);
+        n++;
+    }
+
+    /* Then messages never handed out. */
+    while (n < max && q->next <= last) {
+        if (lease_ms > 0) {
+            if (FL_COUNT(q) >= BJM_INFLIGHT_MAX) break;   /* backpressure */
+            q->fl[q->nfl++] = q->next;
+            q->fl[q->nfl++] = now + lease_ms;
+            q->fl[q->nfl++] = 1;
+        }
+        chosen[n] = q->next;
+        attempts[n] = 1;
+        n++;
+        q->next++;
+    }
+
+    /*
+     * Persist the leases before handing the jobs out. The other order
+     * could give a job to a worker and forget it had, which is the one
+     * failure this table exists to prevent.
+     */
+    e = queue_store(st, subject_name, group, q);
+    if (e) return e;
+
+    bj_builder *b = st->bld;
+    bj_builder_reset(b);
+    bj_begin_array(b);
+    for (int i = 0; i < n; i++) {
+        uint64_t term;
+        int type;
+        const uint8_t *payload;
+        size_t plen;
+        if (elog_get(s->log, chosen[i], &term, &type, &payload, &plen) != BJ_OK)
+            continue;   /* trimmed out from under us; skip it */
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"index", 5);
+        bj_put_int(b, (int64_t)chosen[i]);
+        bj_put_key(b, (const uint8_t *)"attempts", 8);
+        bj_put_int(b, (int64_t)attempts[i]);
+        bj_put_key(b, (const uint8_t *)"expires_ms", 10);
+        bj_put_int(b, (int64_t)(lease_ms ? now + lease_ms : 0));
+        bj_put_key(b, (const uint8_t *)"payload", 7);
+        bj_put_binary(b, payload, (uint32_t)plen);
+        bj_end_object(b);
+        (*count)++;
+    }
+    bj_end_array(b);
+
+    e = bj_builder_error(b);
+    if (e) return e;
+    *out = bj_builder_data(b, out_len);
+    return *out ? BJ_OK : BJ_ERR_STATE;
+}
+
+static int queue_release(bjm_store *st, const char *subject, const char *group,
+                         uint64_t index, int drop, int *found) {
+    *found = 0;
+    int e = queues_open(st);
+    if (e) return e;
+
+    qrec *q = st->qscratch;
+    int existed = 0;
+    e = queue_load(st, subject, group, q, &existed);
+    if (e || !existed) return e;
+
+    int at = fl_find(q, index);
+    if (at < 0) return BJ_OK;      /* never leased, or already finished */
+
+    if (drop) fl_remove(q, at);
+    else      FL_EXPIRES(q, at) = 0;   /* due now; the next take picks it up */
+
+    *found = 1;
+    return queue_store(st, subject, group, q);
+}
+
+int bjm_done(bjm_store *st, const char *subject, const char *group,
+             uint64_t index, int *found) {
+    return queue_release(st, subject, group, index, 1, found);
+}
+
+int bjm_fail(bjm_store *st, const char *subject, const char *group,
+             uint64_t index, int *found) {
+    return queue_release(st, subject, group, index, 0, found);
+}
+
+int bjm_queue_config(bjm_store *st, const char *subject, const char *group,
+                     uint64_t lease_ms, uint64_t max_attempts) {
+    int e = queues_open(st);
+    if (e) return e;
+
+    qrec *q = st->qscratch;
+    int existed = 0;
+    e = queue_load(st, subject, group, q, &existed);
+    if (e) return e;
+    q->lease_ms = lease_ms;
+    q->max_attempts = max_attempts;
+
+    e = queue_store(st, subject, group, q);
+    if (e) return e;
+    return bpt_sync(st->queues);   /* config, not a hot path */
+}
+
+int bjm_queue_delete(bjm_store *st, const char *subject, const char *group,
+                     int *deleted) {
+    *deleted = 0;
+    int e = queues_open(st);
+    if (e) return e;
+
+    char buf[BJM_SUBJECT_MAX + BJM_GROUP_MAX + 2];
+    bpt_key key;
+    e = queue_key(buf, sizeof buf, subject, group, &key);
+    if (e) return e;
+
+    int found = 0;
+    const uint8_t *val = NULL;
+    size_t val_len = 0;
+    e = bpt_search(st->queues, &key, &found, &val, &val_len);
+    if (e || !found) return e;
+
+    e = bpt_delete(st->queues, &key);
+    if (e) return e;
+    *deleted = 1;
+    return bpt_sync(st->queues);
+}
+
+/* Bounds of one subject's group keys, as for consumers. */
+static void queue_range(const char *subject, char *lo, size_t lo_cap,
+                        char *hi, size_t hi_cap,
+                        bpt_key *min, bpt_key *max, int *prefix_len) {
+    int nlo = snprintf(lo, lo_cap, "%s/", subject);
+    int nhi = snprintf(hi, hi_cap, "%s0", subject);
+    min->is_string = 1; min->num = 0;
+    min->str = (const uint8_t *)lo; min->str_len = (uint32_t)nlo;
+    max->is_string = 1; max->num = 0;
+    max->str = (const uint8_t *)hi; max->str_len = (uint32_t)nhi;
+    *prefix_len = nlo;
+}
+
+int bjm_queues(bjm_store *st, const char *subject,
+               const uint8_t **out, size_t *out_len) {
+    int e = queues_open(st);
+    if (e) return e;
+
+    uint64_t last = bjm_last_index(st, subject);
+    uint64_t now = now_ms();
+
+    char lo[BJM_SUBJECT_MAX + 2], hi[BJM_SUBJECT_MAX + 2];
+    bpt_key min, max;
+    int nlo;
+    queue_range(subject, lo, sizeof lo, hi, sizeof hi, &min, &max, &nlo);
+
+    bpt_cursor *c = bpt_cursor_open(st->queues, &min, &max);
+    if (!c) return BJ_ERR_STATE;
+
+    bj_builder *b = st->bld;
+    bj_builder_reset(b);
+    bj_begin_array(b);
+
+    bpt_key k;
+    const uint8_t *val;
+    size_t val_len;
+    int rc;
+    while ((rc = bpt_cursor_next(c, &k, &val, &val_len)) == 1) {
+        if (k.str_len <= (uint32_t)nlo) continue;
+        qrec q;
+        memset(&q, 0, sizeof q);
+        bj_visitor v = bjm_visitor_noop(&q);
+        v.on_key = q_key;
+        v.on_int = q_int;
+        v.on_array_end = q_array_end;
+        if (bj_decode(val, val_len, &v, NULL) != BJ_OK) continue;
+        q.nfl -= q.nfl % 3;
+
+        int expired = 0;
+        for (int i = 0; i < FL_COUNT(&q); i++)
+            if (FL_EXPIRES(&q, i) <= now) expired++;
+
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"group", 5);
+        bj_put_string(b, k.str + nlo, k.str_len - (uint32_t)nlo);
+        bj_put_key(b, (const uint8_t *)"next", 4);
+        bj_put_int(b, (int64_t)q.next);
+        /* Not yet handed to anyone. */
+        bj_put_key(b, (const uint8_t *)"pending", 7);
+        bj_put_int(b, (int64_t)(last >= q.next ? last - q.next + 1 : 0));
+        /* Handed out and not finished; `expired` of them are due back. */
+        bj_put_key(b, (const uint8_t *)"inflight", 8);
+        bj_put_int(b, FL_COUNT(&q));
+        bj_put_key(b, (const uint8_t *)"expired", 7);
+        bj_put_int(b, expired);
+        bj_put_key(b, (const uint8_t *)"lease_ms", 8);
+        bj_put_int(b, (int64_t)q.lease_ms);
+        bj_put_key(b, (const uint8_t *)"max_attempts", 12);
+        bj_put_int(b, (int64_t)q.max_attempts);
+        bj_put_key(b, (const uint8_t *)"dead", 4);
+        bj_put_int(b, (int64_t)q.dead_total);
+        bj_put_key(b, (const uint8_t *)"dead_indexes", 12);
+        bj_begin_array(b);
+        for (int i = 0; i < q.ndead; i++) bj_put_int(b, (int64_t)q.dead[i]);
+        bj_end_array(b);
+        bj_end_object(b);
+    }
+    bpt_cursor_close(c);
+    if (rc < 0) return rc;
+
+    bj_end_array(b);
+    e = bj_builder_error(b);
+    if (e) return e;
+    *out = bj_builder_data(b, out_len);
+    return *out ? BJ_OK : BJ_ERR_STATE;
+}
+
+int bjm_queue_floor(bjm_store *st, const char *subject,
+                    uint64_t *floor, int *ngroups) {
+    *floor = UINT64_MAX;
+    *ngroups = 0;
+    int e = queues_open(st);
+    if (e) return e;
+
+    char lo[BJM_SUBJECT_MAX + 2], hi[BJM_SUBJECT_MAX + 2];
+    bpt_key min, max;
+    int nlo;
+    queue_range(subject, lo, sizeof lo, hi, sizeof hi, &min, &max, &nlo);
+
+    bpt_cursor *c = bpt_cursor_open(st->queues, &min, &max);
+    if (!c) return BJ_ERR_STATE;
+
+    bpt_key k;
+    const uint8_t *val;
+    size_t val_len;
+    int rc;
+    while ((rc = bpt_cursor_next(c, &k, &val, &val_len)) == 1) {
+        if (k.str_len <= (uint32_t)nlo) continue;
+        qrec q;
+        memset(&q, 0, sizeof q);
+        bj_visitor v = bjm_visitor_noop(&q);
+        v.on_key = q_key;
+        v.on_int = q_int;
+        v.on_array_end = q_array_end;
+        if (bj_decode(val, val_len, &v, NULL) != BJ_OK) continue;
+        q.nfl -= q.nfl % 3;
+
+        /* Everything from here up is still owed to somebody: either not
+         * handed out yet, or leased and possibly coming back. */
+        uint64_t owed = q.next;
+        for (int i = 0; i < FL_COUNT(&q); i++)
+            if (FL_INDEX(&q, i) < owed) owed = FL_INDEX(&q, i);
+
+        uint64_t f = owed > 0 ? owed - 1 : 0;
+        if (f < *floor) *floor = f;
+        (*ngroups)++;
+    }
+    bpt_cursor_close(c);
+    return rc < 0 ? rc : BJ_OK;
+}
+
 /* ---- inspection ------------------------------------------------------ */
 
 int bjm_subject_info(bjm_store *st, const char *subject_name,
@@ -783,13 +1299,26 @@ int bjm_trim(bjm_store *st, const char *subject_name, uint64_t before,
     if (new_base > last) new_base = last;
 
     if (!force) {
+        /*
+         * Two things can still be owed a message: a subscription that has
+         * not acknowledged it, and a queue group that has not run it. The
+         * lower of the two bounds wins.
+         */
+        uint64_t protect = UINT64_MAX;
+
         int nconsumers = 0;
         uint64_t min_acked = UINT64_MAX;
         e = bjm_consumer_stats(st, subject_name, &nconsumers, &min_acked);
         if (e) return e;
-        /* Never drop a message a consumer has not acknowledged. With no
-         * consumers there is nothing to protect. */
-        if (nconsumers > 0 && new_base > min_acked) new_base = min_acked;
+        if (nconsumers > 0) protect = min_acked;
+
+        uint64_t qfloor = UINT64_MAX;
+        int ngroups = 0;
+        e = bjm_queue_floor(st, subject_name, &qfloor, &ngroups);
+        if (e) return e;
+        if (ngroups > 0 && qfloor < protect) protect = qfloor;
+
+        if (protect != UINT64_MAX && new_base > protect) new_base = protect;
     }
 
     *out_base = base;

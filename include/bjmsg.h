@@ -121,6 +121,79 @@ int bjm_consumer_stats(bjm_store *st, const char *subject,
 /* Highest index currently in `subject`, or 0 if it does not exist. */
 uint64_t bjm_last_index(bjm_store *st, const char *subject);
 
+/* ---- queue groups (competing consumers) -------------------------------- */
+
+/*
+ * A queue group turns a subject into a job queue: each message goes to
+ * exactly one member of the group rather than to all of them.
+ *
+ * A read receipt cannot express this, because completion is out of order
+ * — worker A can still be on job 5 when worker B finishes job 6, and no
+ * single high-water mark says that. The state is therefore two things:
+ *
+ *   next      the lowest index never yet handed out
+ *   inflight  index -> (lease expiry, attempts) for jobs handed out but
+ *             not yet finished
+ *
+ * Which is sufficient, and cheaper than it looks: below `next` a job is
+ * either in the inflight table or it is done, so "done" needs no storage
+ * at all — it is the absence of an entry. The table is bounded by how
+ * many jobs are being worked on at once, never by how many have run.
+ *
+ * A lease that expires makes its job available again, so a worker that
+ * dies loses nothing. That is at-least-once: the broker cannot tell a
+ * dead worker from a slow one, so a slow job is run twice and jobs must
+ * be idempotent. A group with lease_ms == 0 opts out — take advances
+ * `next` and records nothing, which is at-most-once and loses the job if
+ * the worker dies.
+ */
+#define BJM_GROUP_MAX 128
+#define BJM_INFLIGHT_MAX 256
+#define BJM_LEASE_DEFAULT_MS 30000
+#define BJM_DEAD_MAX 64
+#define BJM_MAX_ATTEMPTS_DEFAULT 10
+
+int bjm_group_valid(const char *s);
+
+/*
+ * Lease up to `max` jobs to a caller. Expired leases are redelivered
+ * before untouched messages are handed out. On BJ_OK, out/out_len expose
+ * a binjson ARRAY of { index, attempts, expires_ms, payload }; those
+ * bytes are owned by the store and valid until the next call.
+ */
+int bjm_take(bjm_store *st, const char *subject, const char *group,
+             int max, uint64_t lease_ms, int *count,
+             const uint8_t **out, size_t *out_len);
+
+/* Finish a job: drop its lease permanently. *found is 0 if it was not
+ * leased (an expired-and-retaken job, or a bad index). */
+int bjm_done(bjm_store *st, const char *subject, const char *group,
+             uint64_t index, int *found);
+/* Give a job back now rather than waiting for its lease to expire. */
+int bjm_fail(bjm_store *st, const char *subject, const char *group,
+             uint64_t index, int *found);
+
+/*
+ * `max_attempts` bounds redelivery: a job that has been handed out that
+ * many times without finishing is dropped from the queue and counted as
+ * dead rather than handed out again. 0 retries forever, which lets one
+ * permanently-failing job starve the queue.
+ */
+int bjm_queue_config(bjm_store *st, const char *subject, const char *group,
+                     uint64_t lease_ms, uint64_t max_attempts);
+int bjm_queue_delete(bjm_store *st, const char *subject, const char *group,
+                     int *deleted);
+int bjm_queues(bjm_store *st, const char *subject,
+               const uint8_t **out, size_t *out_len);
+
+/*
+ * The lowest index any group still owes to a worker, minus one — the
+ * boundary below which trimming would destroy unrun jobs. *ngroups is 0
+ * when the subject has no queue groups.
+ */
+int bjm_queue_floor(bjm_store *st, const char *subject,
+                    uint64_t *floor, int *ngroups);
+
 /* ---- inspection ------------------------------------------------------- */
 
 /*
@@ -203,6 +276,11 @@ int bjm_cmd_health(int argc, char **argv);
 int bjm_cmd_trim(int argc, char **argv);
 int bjm_cmd_seek(int argc, char **argv);
 int bjm_cmd_policy(int argc, char **argv);
+int bjm_cmd_queue(int argc, char **argv);
+int bjm_cmd_take(int argc, char **argv);
+int bjm_cmd_done(int argc, char **argv);
+int bjm_cmd_fail(int argc, char **argv);
+int bjm_cmd_work(int argc, char **argv);
 
 /* ---- rendering ------------------------------------------------------- */
 

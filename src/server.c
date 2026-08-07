@@ -453,6 +453,166 @@ static void h_trim(http11c_request *req, http11c_response *res) {
     res_bj(res, 200, out, out_len);
 }
 
+/* As query_consumer, for the `group` parameter. */
+static int query_group(http11c_request *req, http11c_response *res,
+                       char *out, size_t out_size) {
+    int rc = http11c_req_query_get(req, "group", out, out_size);
+    if (rc == 0) return 0;
+    if (rc != 1 || !bjm_group_valid(out)) {
+        res_err(res, 400, "invalid group: expected 1-128 chars of "
+                          "[A-Za-z0-9_.-], no leading/trailing dot\n");
+        return -1;
+    }
+    return 1;
+}
+
+/* Every queue route needs a valid subject and group; answers the request
+ * itself and returns 0 when either is missing. */
+static int queue_target(http11c_request *req, http11c_response *res,
+                        const char *prefix, const char **subject,
+                        char *group, size_t group_size) {
+    *subject = subject_of(req, res, prefix);
+    if (!*subject) return 0;
+    int has = query_group(req, res, group, group_size);
+    if (has < 0) return 0;
+    if (!has) {
+        res_err(res, 400, "?group=<name> is required\n");
+        return 0;
+    }
+    return 1;
+}
+
+static void h_take(http11c_request *req, http11c_response *res) {
+    app *a = http11c_req_ctx(req);
+
+    const char *subject;
+    char group[BJM_GROUP_MAX + 1];
+    if (!queue_target(req, res, "/take/", &subject, group, sizeof group)) return;
+
+    int max = (int)query_u64(req, "max", 1);
+    /* UINT64_MAX means "whatever the group is configured for". */
+    uint64_t lease = query_u64(req, "lease", UINT64_MAX);
+
+    int count = 0;
+    const uint8_t *out = NULL;
+    size_t out_len = 0;
+    int e = bjm_take(a->store, subject, group, max, lease,
+                     &count, &out, &out_len);
+    if (e) { res_err(res, status_for(e), "no such subject\n"); return; }
+
+    char buf[32];
+    snprintf(buf, sizeof buf, "%d", count);
+    http11c_res_header(res, "X-Bjmsg-Count", buf);
+    res_bj(res, 200, out, out_len);
+}
+
+static void h_job_end(http11c_request *req, http11c_response *res, int done) {
+    app *a = http11c_req_ctx(req);
+
+    const char *subject;
+    char group[BJM_GROUP_MAX + 1];
+    const char *prefix = done ? "/done/" : "/fail/";
+    if (!queue_target(req, res, prefix, &subject, group, sizeof group)) return;
+
+    uint64_t index = query_u64(req, "index", 0);
+    if (index == 0) {
+        res_err(res, 400, "?index=<n> is required\n");
+        return;
+    }
+
+    int found = 0;
+    int e = done ? bjm_done(a->store, subject, group, index, &found)
+                 : bjm_fail(a->store, subject, group, index, &found);
+    if (e) { res_err(res, status_for(e), "queue update failed\n"); return; }
+
+    bj_builder *b = a->bld;
+    bj_builder_reset(b);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"subject", 7);
+    bj_put_string(b, (const uint8_t *)subject, (uint32_t)strlen(subject));
+    bj_put_key(b, (const uint8_t *)"group", 5);
+    bj_put_string(b, (const uint8_t *)group, (uint32_t)strlen(group));
+    bj_put_key(b, (const uint8_t *)"index", 5);
+    bj_put_int(b, (int64_t)index);
+    /*
+     * 0 means the lease was not held — the job had already expired and
+     * been handed to somebody else, or it was never leased at all. Worth
+     * reporting rather than swallowing: it is how a worker learns it ran
+     * past its lease and its result may be a duplicate.
+     */
+    bj_put_key(b, (const uint8_t *)"held", 4);
+    bj_put_bool(b, found);
+    bj_end_object(b);
+
+    size_t out_len = 0;
+    const uint8_t *out = bj_builder_data(b, &out_len);
+    if (!out) { res_err(res, 500, "encode failed\n"); return; }
+    res_bj(res, 200, out, out_len);
+}
+
+static void h_done(http11c_request *req, http11c_response *res) {
+    h_job_end(req, res, 1);
+}
+
+static void h_fail(http11c_request *req, http11c_response *res) {
+    h_job_end(req, res, 0);
+}
+
+static void h_queues(http11c_request *req, http11c_response *res) {
+    app *a = http11c_req_ctx(req);
+
+    const char *subject = subject_of(req, res, "/queue/");
+    if (!subject) return;
+
+    const uint8_t *out = NULL;
+    size_t out_len = 0;
+    int e = bjm_queues(a->store, subject, &out, &out_len);
+    if (e) { res_err(res, status_for(e), "listing failed\n"); return; }
+    res_bj(res, 200, out, out_len);
+}
+
+static void h_queue_config(http11c_request *req, http11c_response *res) {
+    app *a = http11c_req_ctx(req);
+
+    const char *subject;
+    char group[BJM_GROUP_MAX + 1];
+    if (!queue_target(req, res, "/queue/", &subject, group, sizeof group)) return;
+
+    uint64_t lease = query_u64(req, "lease_ms", BJM_LEASE_DEFAULT_MS);
+    uint64_t attempts = query_u64(req, "max_attempts", BJM_MAX_ATTEMPTS_DEFAULT);
+    int e = bjm_queue_config(a->store, subject, group, lease, attempts);
+    if (e) { res_err(res, status_for(e), "queue config failed\n"); return; }
+    h_queues(req, res);
+}
+
+static void h_queue_delete(http11c_request *req, http11c_response *res) {
+    app *a = http11c_req_ctx(req);
+
+    const char *subject;
+    char group[BJM_GROUP_MAX + 1];
+    if (!queue_target(req, res, "/queue/", &subject, group, sizeof group)) return;
+
+    int deleted = 0;
+    int e = bjm_queue_delete(a->store, subject, group, &deleted);
+    if (e) { res_err(res, status_for(e), "queue delete failed\n"); return; }
+
+    bj_builder *b = a->bld;
+    bj_builder_reset(b);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"subject", 7);
+    bj_put_string(b, (const uint8_t *)subject, (uint32_t)strlen(subject));
+    bj_put_key(b, (const uint8_t *)"group", 5);
+    bj_put_string(b, (const uint8_t *)group, (uint32_t)strlen(group));
+    bj_put_key(b, (const uint8_t *)"deleted", 7);
+    bj_put_bool(b, deleted);
+    bj_end_object(b);
+
+    size_t out_len = 0;
+    const uint8_t *out = bj_builder_data(b, &out_len);
+    if (!out) { res_err(res, 500, "encode failed\n"); return; }
+    res_bj(res, 200, out, out_len);
+}
+
 static void h_policy_get(http11c_request *req, http11c_response *res) {
     app *a = http11c_req_ctx(req);
 
@@ -592,6 +752,12 @@ static void h_not_found(http11c_request *req, http11c_response *res) {
         "  GET    /sub/<subject>?from=|consumer=\n"
         "  POST   /ack/<subject>?consumer=&index=\n"
         "  POST   /trim/<subject>?before=|keep=[&force=1]\n"
+        "  POST   /take/<subject>?group=&max=&lease=\n"
+        "  POST   /done/<subject>?group=&index=\n"
+        "  POST   /fail/<subject>?group=&index=\n"
+        "  GET    /queue/<subject>\n"
+        "  PUT    /queue/<subject>?group=&lease_ms=&max_attempts=\n"
+        "  DELETE /queue/<subject>?group=\n"
         "  GET    /consumers/<subject>\n"
         "  DELETE /consumers/<subject>?consumer=\n"
         "  GET    /info/<subject>\n"
@@ -633,6 +799,12 @@ int bjm_serve(const char *host, int port, const char *dir) {
     http11c_route(s, "GET",  "/sub/*", h_subscribe);
     http11c_route(s, "POST", "/ack/*", h_ack);
     http11c_route(s, "POST", "/trim/*", h_trim);
+    http11c_route(s, "POST", "/take/*", h_take);
+    http11c_route(s, "POST", "/done/*", h_done);
+    http11c_route(s, "POST", "/fail/*", h_fail);
+    http11c_route(s, "GET",  "/queue/*", h_queues);
+    http11c_route(s, "PUT",  "/queue/*", h_queue_config);
+    http11c_route(s, "DELETE", "/queue/*", h_queue_delete);
     http11c_route(s, "GET",  "/consumers/*", h_consumers);
     http11c_route(s, "DELETE", "/consumers/*", h_unsubscribe);
     http11c_route(s, "GET",  "/info/*", h_info);

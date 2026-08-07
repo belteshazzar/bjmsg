@@ -65,6 +65,12 @@ bare `curl` against a broken request is readable.
 | `GET /sub/<subject>` | `?consumer=&ack=&start=` | same, from the consumer's receipt |
 | `POST /ack/<subject>` | `?consumer=&index=` | `{ subject, consumer, acked }` |
 | `POST /trim/<subject>` | `?before=` or `?keep=` `[&force=1]` | `{ subject, removed, base, last }` |
+| `POST /take/<subject>` | `?group=&max=&lease=` | ARRAY of `{ index, attempts, expires_ms, payload }` |
+| `POST /done/<subject>` | `?group=&index=` | `{ subject, group, index, held }` |
+| `POST /fail/<subject>` | `?group=&index=` | same |
+| `GET /queue/<subject>` | | ARRAY of group states |
+| `PUT /queue/<subject>` | `?group=&lease_ms=&max_attempts=` | the stored groups |
+| `DELETE /queue/<subject>` | `?group=` | `{ subject, group, deleted }` |
 | `GET /policy/<subject>` | | the subject's retention policy |
 | `PUT /policy/<subject>` | `?max_age_s=&max_messages=&max_bytes=&ignore_consumers=` | the stored policy |
 | `DELETE /policy/<subject>` | | `{ subject, cleared }` |
@@ -183,6 +189,81 @@ bjmsg seek work --consumer w1 --index 40 # or just move it forward
 `seek` only moves a receipt forward, keeping the invariant that receipts
 never rewind. To replay a subject, delete the subscription and rejoin.
 
+## Job queues
+
+A **queue group** turns a subject into a work queue: each message goes to
+exactly one member of the group instead of to all of them.
+
+```sh
+bjmsg work jobs --group workers --exec ./handle-job   # run one per job
+bjmsg queue jobs                                      # what the groups are doing
+```
+
+`work` takes one job at a time, writes the payload to the command's stdin
+with `BJMSG_SUBJECT` / `BJMSG_GROUP` / `BJMSG_INDEX` / `BJMSG_ATTEMPTS` in
+its environment, and finishes the job if the command exits 0 or returns it
+to the queue otherwise. Run as many as you like; they compete. The
+primitives underneath are `take`, `done` and `fail` if you would rather
+drive it yourself.
+
+### Why a receipt could not do this
+
+A durable subscription's state is one number, and competing consumers
+break that immediately: worker A can still be on job 5 when worker B
+finishes job 6, and no single high-water mark says so. A group therefore
+keeps two things:
+
+- **`next`** — the lowest index never yet handed out.
+- **an in-flight table** — index → `(lease expiry, attempts)` for jobs
+  taken but not finished.
+
+Which is cheaper than it sounds, because *done needs no storage*: below
+`next`, a job is either in the table or it is finished, so completion is
+the absence of an entry. The table is bounded by how many jobs are being
+worked on at once, never by how many have ever run. A million-job queue
+with eight workers has eight entries.
+
+### Leases, redelivery, and giving up
+
+A taken job is held for `--lease` (default 30s). If it is neither finished
+nor failed by then, the lease expires and the job goes back — so a worker
+that dies loses nothing. Expired leases are handed out before untouched
+messages, so a retry is not starved behind the queue.
+
+That makes delivery **at-least-once**, and the reason is worth stating
+plainly: the broker cannot tell a dead worker from a slow one, so a slow
+job is run twice. Jobs must be idempotent. `BJMSG_ATTEMPTS` above 1 is a
+handler's warning that it is seeing a job again.
+
+`--max-attempts` (default 10) bounds that. A job delivered that many times
+without finishing is dropped and counted as dead rather than handed out
+forever — without it, one permanently-failing job is redelivered as fast
+as workers can ask for it and starves everything else:
+
+```sh
+bjmsg queue jobs --group workers --lease 30s --max-attempts 3
+bjmsg queue jobs
+[{"group":"workers","next":7,"pending":0,"inflight":0,"expired":0,
+  "lease_ms":2000,"max_attempts":3,"dead":1,"dead_indexes":[4]}]
+```
+
+`--lease 0` opts out of the whole mechanism: jobs are taken and forgotten,
+which is at-most-once and loses the job if the worker dies.
+
+### What you give up
+
+- **Ordering.** Job 6 can finish before job 5. Inherent to competing
+  consumers; if you need per-key ordering, use one subject per key.
+- **Pull, not push.** NATS pushes round-robin to queue-group members;
+  http11c cannot push, so a worker asks when it wants work. That is
+  work-stealing, which balances load better — a slow worker simply asks
+  less often instead of accumulating a backlog it cannot serve.
+
+Queue groups and fan-out subscriptions are independent state on the same
+subject, so a log can be tailed for audit while being consumed as a queue.
+Retention knows about both: a trim will not discard a job that is leased
+or has not been handed out yet.
+
 ## Query commands
 
 These connect to a running broker, ask one question, print the answer and
@@ -296,9 +377,13 @@ What a reader sees after a trim depends on which kind of cursor it holds:
 - **Single subject per subscribe.** No wildcards or multi-subject
   subscriptions yet; the design for those is a subject registry (a B+
   tree, prefix-scanned) plus one cursor per matched subject.
-- **Fan-out only, no work queues.** Consumers each get every message.
-  Sharing one message stream between competing workers would need the
-  broker to hand out ranges rather than track a single receipt.
+- **A queue group's in-flight table is capped** at 256 jobs. Past that a
+  `take` returns nothing until acks come in, which is backpressure rather
+  than an error — but it does bound how many jobs one group can have
+  running at once.
+- **Dead-lettered jobs are counted, not moved.** `queue` reports their
+  indexes and they stay in the log; nothing routes them to a dead-letter
+  subject for reprocessing.
 - **Consumer names are asserted, not authenticated.** Any client claiming
   a name advances that subscription's receipt.
 - **The retention sweep is O(subjects with policies).** Fine for tens or

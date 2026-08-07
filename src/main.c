@@ -27,6 +27,13 @@ static void usage(void) {
         "  bjmsg sub         [--url URL] <subject> [--consumer NAME] [--tail]\n"
         "                    [--from N] [--follow]\n"
         "\n"
+        "job queues (each message goes to one group member):\n"
+        "  bjmsg work        [--url URL] <subject> --group G --exec CMD\n"
+        "  bjmsg take        [--url URL] <subject> --group G [--max N]\n"
+        "  bjmsg done        [--url URL] <subject> --group G --index N\n"
+        "  bjmsg fail        [--url URL] <subject> --group G --index N\n"
+        "  bjmsg queue       [--url URL] <subject> [--group G [--lease D]]\n"
+        "\n"
         "query a running broker and exit:\n"
         "  bjmsg health      [--url URL]\n"
         "  bjmsg subjects    [--url URL]\n"
@@ -94,6 +101,11 @@ int main(int argc, char **argv) {
         { "trim",        bjm_cmd_trim },
         { "seek",        bjm_cmd_seek },
         { "policy",      bjm_cmd_policy },
+        { "queue",       bjm_cmd_queue },
+        { "take",        bjm_cmd_take },
+        { "done",        bjm_cmd_done },
+        { "fail",        bjm_cmd_fail },
+        { "work",        bjm_cmd_work },
     };
 
     for (size_t i = 0; i < sizeof clients / sizeof *clients; i++) {

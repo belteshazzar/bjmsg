@@ -625,10 +625,16 @@ typedef struct {
     const char *url_base;
     const char *subject;    /* first positional, when the command takes one */
     const char *consumer;
+    const char *group;
+    const char *exec;
     uint64_t    before, keep, index;
     uint64_t    max_age, max_messages, max_bytes;
-    long        retry_ms;
-    int         force, clear, ignore_consumers;
+    uint64_t    lease_ms;
+    uint64_t    max_attempts;
+    int         have_lease, have_attempts;
+    int         max;
+    long        retry_ms, interval_ms;
+    int         force, clear, del, ignore_consumers;
 } query_opts;
 
 /* Returns 0 on success, or an exit code (2) on a bad argument. */
@@ -673,8 +679,36 @@ static int query_parse(int argc, char **argv, query_opts *o, const char *usage) 
                                 "4096, 512K, 100M, 2G\n");
                 return 2;
             }
+        } else if (strcmp(a, "--group") == 0) {
+            if (!(o->group = arg_value(argc, argv, &i, "--group"))) return 2;
+        } else if (strcmp(a, "--exec") == 0) {
+            if (!(o->exec = arg_value(argc, argv, &i, "--exec"))) return 2;
+        } else if (strcmp(a, "--max") == 0) {
+            const char *v = arg_value(argc, argv, &i, "--max");
+            if (!v) return 2;
+            o->max = atoi(v);
+        } else if (strcmp(a, "--lease") == 0) {
+            const char *v = arg_value(argc, argv, &i, "--lease");
+            uint64_t secs;
+            if (!v || parse_duration(v, &secs) != 0) {
+                fprintf(stderr, "bjmsg: --lease wants a duration like "
+                                "30s, 5m, or 0 to disable leasing\n");
+                return 2;
+            }
+            o->lease_ms = secs * 1000;
+            o->have_lease = 1;
+        } else if (strcmp(a, "--max-attempts") == 0) {
+            const char *v = arg_value(argc, argv, &i, "--max-attempts");
+            if (!v) return 2;
+            o->max_attempts = strtoull(v, NULL, 10);
+            o->have_attempts = 1;
+        } else if (strcmp(a, "--interval") == 0) {
+            const char *v = arg_value(argc, argv, &i, "--interval");
+            if (!v || parse_ms(v, &o->interval_ms) != 0) return 2;
         } else if (strcmp(a, "--ignore-consumers") == 0) {
             o->ignore_consumers = 1;
+        } else if (strcmp(a, "--delete") == 0) {
+            o->del = 1;
         } else if (strcmp(a, "--clear") == 0) {
             o->clear = 1;
         } else if (strcmp(a, "--force") == 0) {
@@ -862,6 +896,278 @@ int bjm_cmd_policy(int argc, char **argv) {
                      o.ignore_consumers);
     if (n < 0 || (size_t)n >= sizeof url) return 2;
     return query_run(&o, "PUT", url);
+}
+
+/* ---- queue groups ------------------------------------------------------ */
+
+#define QUEUE_USAGE \
+    "usage: bjmsg queue [--url URL] <subject> [--group G [--lease D]\n" \
+    "                   [--delete]]\n" \
+    "\n" \
+    "  (no --group)   show every queue group on the subject\n" \
+    "  --lease D      how long a taken job is held before it is handed to\n" \
+    "                 somebody else (default 30s). --lease 0 turns leasing\n" \
+    "                 off: jobs are taken and forgotten, so a worker that\n" \
+    "                 dies loses its job.\n" \
+    "  --max-attempts N  give up on a job after N deliveries and count it\n" \
+    "                 dead (default 10). 0 retries forever, which lets one\n" \
+    "                 always-failing job starve the queue.\n" \
+    "  --delete       forget the group\n"
+
+int bjm_cmd_queue(int argc, char **argv) {
+    query_opts o;
+    int rc = query_parse(argc, argv, &o, QUEUE_USAGE);
+    if (rc) return rc == 1 ? 0 : rc;
+    if (!o.subject || !bjm_subject_valid(o.subject) ||
+        (o.group && !bjm_group_valid(o.group))) {
+        fputs(QUEUE_USAGE, stderr);
+        return 2;
+    }
+
+    char url[1024];
+    if (!o.group) {
+        snprintf(url, sizeof url, "%s/queue/%s", o.url_base, o.subject);
+        return query_run(&o, NULL, url);
+    }
+    if (o.del) {
+        snprintf(url, sizeof url, "%s/queue/%s?group=%s",
+                 o.url_base, o.subject, o.group);
+        return query_run(&o, "DELETE", url);
+    }
+    snprintf(url, sizeof url,
+             "%s/queue/%s?group=%s&lease_ms=%llu&max_attempts=%llu",
+             o.url_base, o.subject, o.group,
+             (unsigned long long)(o.have_lease ? o.lease_ms
+                                               : BJM_LEASE_DEFAULT_MS),
+             (unsigned long long)(o.have_attempts ? o.max_attempts
+                                                  : BJM_MAX_ATTEMPTS_DEFAULT));
+    return query_run(&o, "PUT", url);
+}
+
+/* Build the /take/ URL shared by `take` and `work`. */
+static void take_url(char *url, size_t cap, const query_opts *o, int max) {
+    int n = snprintf(url, cap, "%s/take/%s?group=%s&max=%d",
+                     o->url_base, o->subject, o->group, max);
+    if (o->have_lease && n > 0 && (size_t)n < cap)
+        snprintf(url + n, cap - n, "&lease=%llu",
+                 (unsigned long long)o->lease_ms);
+}
+
+#define TAKE_USAGE \
+    "usage: bjmsg take [--url URL] <subject> --group G [--max N] [--lease D]\n" \
+    "\n" \
+    "Lease jobs and print them as <index><tab><payload>. Each stays\n" \
+    "leased until `bjmsg done` finishes it, `bjmsg fail` returns it, or\n" \
+    "the lease expires and it goes back to the queue.\n"
+
+int bjm_cmd_take(int argc, char **argv) {
+    query_opts o;
+    int rc = query_parse(argc, argv, &o, TAKE_USAGE);
+    if (rc) return rc == 1 ? 0 : rc;
+    if (!o.subject || !bjm_subject_valid(o.subject) ||
+        !o.group || !bjm_group_valid(o.group)) {
+        fputs(TAKE_USAGE, stderr);
+        return 2;
+    }
+
+    char url[1024];
+    take_url(url, sizeof url, &o, o.max > 0 ? o.max : 1);
+
+    client c;
+    if (client_init(&c, o.retry_ms) != 0) return 1;
+    curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, "POST");
+    curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, "");
+    curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, 0L);
+
+    rc = 1;
+    long status = client_perform(&c, url);
+    if (status == 200) {
+        /* Same batch shape as a subscribe, so the same scanner prints it. */
+        sub_scan s = {0};
+        bj_visitor v = bjm_visitor_noop(&s);
+        v.on_int = s_int;
+        v.on_binary = s_binary;
+        v.on_key = s_key;
+        rc = bj_decode(c.body.p, c.body.len, &v, NULL) == BJ_OK ? 0 : 1;
+    } else if (status > 0) {
+        report_error(&c, status);
+    }
+
+    client_free(&c);
+    return rc;
+}
+
+#define JOBEND_USAGE(verb) \
+    "usage: bjmsg " verb " [--url URL] <subject> --group G --index N\n"
+
+static int job_end(int argc, char **argv, const char *verb, const char *usage) {
+    query_opts o;
+    int rc = query_parse(argc, argv, &o, usage);
+    if (rc) return rc == 1 ? 0 : rc;
+    if (!o.subject || !bjm_subject_valid(o.subject) ||
+        !o.group || !bjm_group_valid(o.group) || o.index == 0) {
+        fputs(usage, stderr);
+        return 2;
+    }
+
+    char url[1024];
+    snprintf(url, sizeof url, "%s/%s/%s?group=%s&index=%llu",
+             o.url_base, verb, o.subject, o.group,
+             (unsigned long long)o.index);
+    return query_run(&o, "POST", url);
+}
+
+int bjm_cmd_done(int argc, char **argv) {
+    return job_end(argc, argv, "done", JOBEND_USAGE("done"));
+}
+
+int bjm_cmd_fail(int argc, char **argv) {
+    return job_end(argc, argv, "fail", JOBEND_USAGE("fail"));
+}
+
+/* ---- the worker loop --------------------------------------------------- */
+
+/*
+ * One job's index and rendered payload, pulled out of a take response.
+ * Only one job is taken at a time here: --exec runs them serially, and a
+ * job held but not started is a job whose lease is burning down.
+ */
+typedef struct {
+    char      key[16];
+    long long index;
+    long long attempts;
+    char     *text;
+    size_t    text_len;
+    int       have;
+} job;
+
+static void job_key(void *ctx, const uint8_t *k, uint32_t len) {
+    job *j = ctx;
+    if (len >= sizeof j->key) len = sizeof j->key - 1;
+    memcpy(j->key, k, len);
+    j->key[len] = '\0';
+}
+
+static void job_int(void *ctx, double v) {
+    job *j = ctx;
+    if (j->have) return;
+    if (strcmp(j->key, "index") == 0)         j->index = (long long)v;
+    else if (strcmp(j->key, "attempts") == 0) j->attempts = (long long)v;
+}
+
+static void job_binary(void *ctx, const uint8_t *bytes, uint32_t len) {
+    job *j = ctx;
+    if (j->have || strcmp(j->key, "payload") != 0) return;
+    FILE *f = open_memstream(&j->text, &j->text_len);
+    if (!f) return;
+    if (bjm_render(f, bytes, len) != BJ_OK) fputs("<undecodable>", f);
+    fclose(f);
+    j->have = 1;
+}
+
+#define WORK_USAGE \
+    "usage: bjmsg work [--url URL] <subject> --group G --exec CMD\n" \
+    "                  [--lease D] [--interval MS]\n" \
+    "\n" \
+    "Take one job at a time and run CMD for each. The payload is written\n" \
+    "to CMD's stdin, and BJMSG_SUBJECT / BJMSG_GROUP / BJMSG_INDEX /\n" \
+    "BJMSG_ATTEMPTS are set in its environment.\n" \
+    "\n" \
+    "CMD exiting 0 finishes the job; anything else returns it to the\n" \
+    "queue immediately. A job whose worker dies is redelivered when its\n" \
+    "lease expires, so CMD must tolerate running twice.\n"
+
+int bjm_cmd_work(int argc, char **argv) {
+    query_opts o;
+    int rc = query_parse(argc, argv, &o, WORK_USAGE);
+    if (rc) return rc == 1 ? 0 : rc;
+    if (!o.subject || !bjm_subject_valid(o.subject) ||
+        !o.group || !bjm_group_valid(o.group) || !o.exec) {
+        fputs(WORK_USAGE, stderr);
+        return 2;
+    }
+    long idle = o.interval_ms > 0 ? o.interval_ms : DEFAULT_POLL_MS;
+
+    client c;
+    if (client_init(&c, o.retry_ms) != 0) return 1;
+
+    char url[1024];
+    take_url(url, sizeof url, &o, 1);
+
+    int failures = 0;
+    while (!g_stop) {
+        curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, "POST");
+        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, "");
+        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, 0L);
+
+        long status = client_perform(&c, url);
+        if (g_stop) break;
+        if (status < 0) { rc = 1; break; }
+        if (status != 200) {
+            if (status == 404) { sleep_ms(idle); continue; }  /* no subject yet */
+            report_error(&c, status);
+            rc = 1;
+            break;
+        }
+
+        job j = {0};
+        bj_visitor v = bjm_visitor_noop(&j);
+        v.on_key = job_key;
+        v.on_int = job_int;
+        v.on_binary = job_binary;
+        if (bj_decode(c.body.p, c.body.len, &v, NULL) != BJ_OK) {
+            fprintf(stderr, "bjmsg: malformed take response\n");
+            rc = 1;
+            break;
+        }
+        if (!j.have) { sleep_ms(idle); continue; }   /* queue is empty */
+
+        char env[32];
+        setenv("BJMSG_SUBJECT", o.subject, 1);
+        setenv("BJMSG_GROUP", o.group, 1);
+        snprintf(env, sizeof env, "%lld", j.index);
+        setenv("BJMSG_INDEX", env, 1);
+        /* >1 means this job was run before and its lease expired — the
+         * signal a handler needs to decide whether to guard itself. */
+        snprintf(env, sizeof env, "%lld", j.attempts);
+        setenv("BJMSG_ATTEMPTS", env, 1);
+
+        FILE *child = popen(o.exec, "w");
+        int ok = 0;
+        if (!child) {
+            fprintf(stderr, "bjmsg: cannot run '%s'\n", o.exec);
+        } else {
+            fputs(j.text ? j.text : "", child);
+            int st = pclose(child);
+            ok = (st == 0);
+        }
+        free(j.text);
+
+        /* Report the outcome on a second handle's worth of settings: the
+         * same connection, a different URL. */
+        char end[1024];
+        snprintf(end, sizeof end, "%s/%s/%s?group=%s&index=%lld",
+                 o.url_base, ok ? "done" : "fail", o.subject, o.group, j.index);
+        curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, "POST");
+        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, "");
+        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, 0L);
+        if (client_perform(&c, end) != 200 && !g_stop)
+            fprintf(stderr, "bjmsg: could not report job %lld as %s\n",
+                    j.index, ok ? "done" : "failed");
+
+        printf("%lld\t%s\n", j.index, ok ? "done" : "failed");
+        fflush(stdout);
+        if (!ok) {
+            failures++;
+            /* A failed job is due again immediately, and this worker is
+             * the one most likely to ask next — pause so it does not spin
+             * on the job it just failed. */
+            sleep_ms(idle);
+        }
+    }
+
+    client_free(&c);
+    return rc ? rc : (failures ? 1 : 0);
 }
 
 #define SEEK_USAGE \
