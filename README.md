@@ -1,1 +1,322 @@
 # bjmsg
+
+Publish/subscribe over HTTP/1.1 with [binjson](https://github.com/mdy-docs/binjson)
+payloads, as one executable that is either the broker or a client.
+
+```sh
+make
+./bin/bjmsg serve &
+./bin/bjmsg pub orders.new "first message"
+./bin/bjmsg sub orders.new --follow
+```
+
+For a broker, three subscribers and a publisher across five terminals —
+the [NATS hello-nats tutorial](https://docs.nats.io/tutorials/hello-nats)
+shape — see [demo/](demo/).
+
+## How it is built
+
+Three vendored pieces, one copy of each:
+
+| submodule | role |
+| --- | --- |
+| [`third_party/binjson`](third_party/binjson) | the wire format: `bj_builder` encoder, visitor-driven decoder |
+| [`third_party/binjson-structures`](third_party/binjson-structures) | `entrylog` — the durable per-subject message log — over `bjio_posix` |
+| [`third_party/http11c`](third_party/http11c) | the HTTP/1.1 server: single-threaded, kqueue/epoll, keep-alive |
+
+binjson-structures carries its own nested `third_party/binjson` submodule
+for its standalone build. We leave it uninitialised and point both builds
+at the top-level copy instead, which is what its README asks a project
+depending on both to do — two binjson checkouts in one binary is the
+failure mode being avoided.
+
+The client half is libcurl. http11c is a server library only, and writing
+a second HTTP implementation to talk to the first one is not a good use of
+anybody's time.
+
+## A subject is an entry log
+
+Each subject is one `<subject>.elog` file, and that single decision
+supplies most of the broker:
+
+- **Message ids** are the log's own indexes — contiguous, assigned by the
+  log, starting at 1.
+- **Payloads** are opaque bytes the log never interprets, so binjson
+  messages pass through unexamined.
+- **Durability** is `elog_sync`: one write plus a real fsync, with a CRC
+  trailer. A torn tail is truncated back to the last good commit when the
+  log is reopened, so a killed broker loses only unacknowledged publishes.
+- **The subscribe response body** is `elog_get_batch`'s output verbatim —
+  a binjson ARRAY of `{ index, term, type, payload }`. Nothing is decoded
+  and re-encoded on the way out.
+
+Raft's `term` is along for the ride at 0: there is no election here, and
+elog's monotonicity rule permits it.
+
+## Protocol
+
+Success bodies are `application/binjson`; errors are `text/plain`, so a
+bare `curl` against a broken request is readable.
+
+| route | body / query | response |
+| --- | --- | --- |
+| `POST /pub/<subject>` | one binjson value | `{ subject, index }` |
+| `GET /sub/<subject>` | `?from=&max=` | ARRAY of `{ index, term, type, payload }` |
+| `GET /sub/<subject>` | `?consumer=&ack=&start=` | same, from the consumer's receipt |
+| `POST /ack/<subject>` | `?consumer=&index=` | `{ subject, consumer, acked }` |
+| `POST /trim/<subject>` | `?before=` or `?keep=` `[&force=1]` | `{ subject, removed, base, last }` |
+| `GET /policy/<subject>` | | the subject's retention policy |
+| `PUT /policy/<subject>` | `?max_age_s=&max_messages=&max_bytes=&ignore_consumers=` | the stored policy |
+| `DELETE /policy/<subject>` | | `{ subject, cleared }` |
+| `GET /policies` | | ARRAY of every policy |
+| `GET /consumers/<subject>` | | ARRAY of `{ consumer, acked, lag }` |
+| `DELETE /consumers/<subject>` | `?consumer=` | `{ subject, consumer, deleted }` |
+| `GET /info/<subject>` | | `{ subject, base, first, last, messages, bytes, consumers }` |
+| `GET /subjects` | | ARRAY of subject names |
+| `GET /health` | | `{ ok, backend, subjects, connections, uptime_s }` |
+
+Subscribe also answers `X-Bjmsg-Count` and `X-Bjmsg-Last-Index`, so a
+client can tell how far behind it is without decoding the body, plus
+`X-Bjmsg-Acked` when a consumer is named.
+
+Subject names are file names: 1–128 bytes of `[A-Za-z0-9_.-]`, no leading
+or trailing dot, no `..`. A publish creates its subject; a subscribe to an
+unknown subject is a 404 rather than an implicit create.
+
+A publish body is checked to be **exactly one complete binjson value**
+before it is accepted. The log would happily store anything, and the
+malformed message would only surface as an undecodable payload in a
+subscriber, after it was durable.
+
+## Subscribers poll
+
+http11c serializes a response the moment the handler returns — there is no
+chunked encoding, no SSE, and no way to hold a response open. So delivery
+is pull-based: the subscriber sends its cursor as `from` and gets back
+whatever exists.
+
+The cursor living in the request is what makes the broker stateless per
+subscriber. There is no session table, nothing to reap, and a subscriber
+that crashes resumes from exactly where it left off. `sub --follow` polls
+on one kept-alive connection, so a poll is a small request on an
+already-open socket.
+
+Because every message is durable, a new subscriber replays the subject
+from the beginning by default. `sub --tail` asks for a cursor past the end
+of the log — the broker answers with an empty batch and the real last
+index — which skips the backlog and gives NATS-core-like "only what is
+published from now on" behaviour.
+
+## Reconnecting
+
+Every client waits and retries when the broker cannot be reached, every
+5 s by default. `--retry MS` changes the wait; `--retry 0` turns it off
+and fails on the first refusal.
+
+```sh
+bjmsg sub greet --follow                 # survives the broker restarting
+bjmsg sub greet --follow --retry 500     # ...more eagerly
+bjmsg pub greet "hi" --retry 0           # fail now rather than wait
+```
+
+So a subscriber can be started before the broker exists, and keeps its
+place across a broker restart.
+
+Only connection failures are retried — an HTTP status is the broker
+answering, and a 404 or 415 is not going to become a 200. Which failures
+qualify depends on the request:
+
+- **Never reached the broker** (connection refused, DNS failure): always
+  retried, since there was no effect to repeat.
+- **Broke partway** (send/receive error, timeout): retried only for
+  requests that are safe to repeat — every `GET`, and `POST /ack`, whose
+  receipt cannot move backwards. **`POST /pub` is not**: the message may
+  already be in the log, and retrying would append it twice. A publish
+  that fails that way is reported rather than silently duplicated.
+
+## Read receipts: durable subscriptions
+
+`sub --consumer NAME` hands the cursor to the broker instead. It persists
+a **read receipt** — the highest index that consumer has acknowledged —
+so rejoining delivers exactly what was missed and nothing else:
+
+```sh
+bjmsg sub work --consumer w1 --follow    # ...run it, stop it, run it again
+bjmsg consumers work
+[{"consumer":"w1","acked":8,"lag":0}]
+```
+
+Receipts live in one B+ tree for the whole store (`_cursors.bpt`), keyed
+`<subject>/<consumer>`. Neither name may contain `/`, so the key parses
+back unambiguously and one subject's consumers are a contiguous range —
+which is what `GET /consumers/<subject>` scans. A receipt only ever moves
+forward, so a late or duplicated ack cannot rewind a consumer into replay.
+
+The ack **piggybacks on the next poll** (`?ack=N`), so a steady-state
+subscriber still makes one request per cycle: the broker records the
+receipt, then picks the next batch from it. The receipt for the final
+batch has nowhere to ride, so `bjmsg sub` catches SIGINT and sends one
+explicit `POST /ack` on the way out — skipping it when `X-Bjmsg-Acked`
+shows a later poll already carried it. That shutdown ack gets a single
+attempt regardless of `--retry`, because hanging on the way out is worse
+than a redelivery that at-least-once already permits.
+
+Delivery is **at-least-once**. An ack commits with a CRC, so it survives
+the broker process dying, but it is not fsynced — that second fsync per
+batch would buy only the difference between "redelivered after a power
+cut" and "not redelivered", and a consumer has to tolerate redelivery
+regardless. The explicit shutdown ack *is* fsynced, since losing that one
+replays a batch the subscriber just finished.
+
+Consumers are independent: each has its own receipt, and every consumer
+sees every message. This is fan-out, not a work queue — two processes
+sharing one consumer name would each advance the same receipt and skip
+each other's messages.
+
+A subscription exists from its first use until it is deleted:
+
+```sh
+bjmsg unsubscribe work --consumer w1     # forget the receipt entirely
+bjmsg seek work --consumer w1 --index 40 # or just move it forward
+```
+
+`seek` only moves a receipt forward, keeping the invariant that receipts
+never rewind. To replay a subject, delete the subscription and rejoin.
+
+## Query commands
+
+These connect to a running broker, ask one question, print the answer and
+exit. They neither publish, subscribe, nor serve:
+
+```sh
+bjmsg health              # {"ok":true,"backend":"kqueue","subjects":3,...}
+bjmsg subjects            # ["logs","orders.new"]
+bjmsg info logs           # {"subject":"logs","base":15,"first":16,"last":20,...}
+bjmsg consumers logs      # [{"consumer":"w1","acked":18,"lag":2}]
+bjmsg policy              # every retention policy
+```
+
+`info` is the one to read when reasoning about retention: `base` is where
+trimming has cut to, `first` is the oldest message still readable, and
+`bytes` is the file on disk.
+
+## Retention policies
+
+A subject can carry a policy the broker enforces on its own, sweeping
+every 10 seconds:
+
+```sh
+bjmsg policy logs --max-age 7d --max-messages 1000000 --max-bytes 2G
+bjmsg policy logs            # show one
+bjmsg policy                 # list every subject that has one
+bjmsg policy logs --clear
+```
+
+Durations take `s`/`m`/`h`/`d`/`w` and sizes take `K`/`M`/`G`/`T`; bare
+numbers are seconds and bytes. Any dimension left unset is unlimited.
+
+**Several limits can apply at once**: each proposes a trim boundary and
+the tightest one wins, so whichever limit is reached first is the one that
+acts. Setting `--max-age 7d --max-bytes 2G` means "a week of history, but
+never more than 2 GB", and either can be the binding constraint at
+different times.
+
+By default a policy will not discard a message a subscription has not
+read — retention loses to a read receipt. That is the safe default and
+also the dangerous one, because a single forgotten consumer then pins the
+log forever. `--ignore-consumers` inverts it and makes the bound real:
+
+```sh
+bjmsg policy logs --max-messages 1000 --ignore-consumers
+```
+
+A note on each dimension:
+
+- **`--max-messages`** is exact.
+- **`--max-bytes`** is approximate. Converting a byte budget to an index
+  needs a per-message size, and only the average is known without walking
+  the log — so a sweep removes slightly too few and the next sweep
+  finishes the job. It converges rather than overshooting.
+- **`--max-age`** is approximate, and needs state the log does not have.
+  Entry logs store no timestamps, and payloads are opaque, so the store
+  keeps its own sparse index: a bounded ring of `(index, time)` marks per
+  subject, one written every `max_age / 128` seconds and only for
+  subjects that actually have an age policy. Resolution is that interval
+  — a 7-day policy marks roughly hourly — so a trim keeps at most one
+  interval more than asked. Erring towards keeping is the safe direction,
+  and it costs the publish path one small write per interval instead of a
+  timestamp index per message.
+
+## Trimming by hand
+
+`trim` does the same thing immediately, with no policy involved:
+
+```sh
+bjmsg trim logs --keep 1000     # keep the newest 1000 messages
+bjmsg trim logs --before 5000   # drop everything below index 5000
+```
+
+This is `elog_compact`: the surviving entries are rewritten into a second
+file which is fsynced and then `renameat`d over the original. The rename
+is atomic, so a crash at any point leaves either the whole old log or the
+whole new one, never a half-trimmed file. **Indexes never shift** —
+trimming raises the log's `base`, so a message keeps the id it was
+published with forever.
+
+By default the boundary is **clamped to the lowest read receipt**, so
+trimming can never discard a message a subscription has not read:
+
+```sh
+bjmsg trim logs --keep 2          # {"removed":3,...}  clamped: a consumer was behind
+bjmsg trim logs --keep 2 --force  # {"removed":5,...}  discarded its unread messages
+```
+
+What a reader sees after a trim depends on which kind of cursor it holds:
+
+- A plain `--from` cursor below the boundary is **clamped** to the oldest
+  surviving message, and the client prints how many it missed. "Read this
+  subject from the start" should mean the start of what exists.
+- A **consumer** cursor gets a `416` instead, naming both ways out:
+  `bjmsg seek` to move it to the new base, or `bjmsg unsubscribe` to start
+  over. A receipt is a claim about what was delivered, so skipping it
+  silently would hide the loss.
+
+## Known limits
+
+- **One fsync per publish.** `elog_append` only buffers and `elog_sync`
+  commits a whole batch, so the log is built for amortising this — but the
+  sync has to happen before the `200` goes out, and http11c sends the
+  response as soon as the handler returns. Batching needs deferred
+  responses first.
+- **Polling latency.** Mean latency is half the poll interval. The fix is
+  the same one: a `http11c_res_defer` / `http11c_respond` pair would turn
+  the poll into a real long-poll with sub-millisecond delivery and no idle
+  traffic. It is outside http11c's stated scope, so it is a deliberate
+  fork-or-upstream decision, not an oversight.
+- **Single subject per subscribe.** No wildcards or multi-subject
+  subscriptions yet; the design for those is a subject registry (a B+
+  tree, prefix-scanned) plus one cursor per matched subject.
+- **Fan-out only, no work queues.** Consumers each get every message.
+  Sharing one message stream between competing workers would need the
+  broker to hand out ranges rather than track a single receipt.
+- **Consumer names are asserted, not authenticated.** Any client claiming
+  a name advances that subscription's receipt.
+- **The retention sweep is O(subjects with policies).** Fine for tens or
+  hundreds; a store with very many policied subjects would want the sweep
+  to prioritise rather than walk them all every 10 s.
+- **No TLS and no auth.** http11c does not do TLS; a reverse proxy is the
+  answer.
+
+## Building
+
+Needs a C11 compiler and libcurl (`curl-config` on `PATH`).
+
+```sh
+git submodule update --init      # top-level submodules only
+make                             # -> bin/bjmsg
+```
+
+`-DBJIO_REQUIRE_SYNC` is on, so binjson-structures rejects at open time
+any io that is writable but cannot fsync — a shipping broker should never
+be silently non-durable. Our own sources build with `-Werror`; the
+vendored ones deliberately do not.

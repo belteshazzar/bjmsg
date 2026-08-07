@@ -1,0 +1,9 @@
+[submodule "third_party/http11c"]
+	path = third_party/http11c
+	url = https://github.com/belteshazzar/http11c.git
+[submodule "third_party/binjson-structures"]
+	path = third_party/binjson-structures
+	url = https://github.com/mdy-docs/binjson-structures.git
+[submodule "third_party/binjson"]
+	path = third_party/binjson
+	url = https://github.com/mdy-docs/binjson.git

@@ -1,3 +1,11 @@
+# Build output
+build/
+bin/
+
+# Default store directory
+bjmsg-data/
+demo/data/
+
 # Prerequisites
 *.d
 
