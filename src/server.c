@@ -169,6 +169,41 @@ static void h_publish(http11c_request *req, http11c_response *res) {
         if (has_id) bjm_dedup_record(a->store, subject, id, index);
     }
 
+    /*
+     * Read-process-write in one call: advance a subscription's receipt on
+     * the INPUT subject as part of publishing the OUTPUT. That is what
+     * makes a pipeline effectively-once — the two writes the broker would
+     * otherwise do separately, with a crash window between them, now
+     * happen before one response.
+     *
+     * They still are not one atomic write, and cannot be: they are
+     * different files. The order is what carries the guarantee. Publish
+     * first, ack second, so a crash in between replays the input, the
+     * handler reruns, and the republished output collapses onto the
+     * existing one by its idempotency key. The alternative order would
+     * ack an input whose output never landed, and lose the message.
+     */
+    char ack_subject[BJM_SUBJECT_MAX + 1];
+    char ack_consumer[BJM_CONSUMER_MAX + 1];
+    uint64_t ack_index = query_u64(req, "ack_index", 0);
+    int acked = 0;
+    if (ack_index > 0 &&
+        http11c_req_query_get(req, "ack_subject", ack_subject,
+                              sizeof ack_subject) == 1 &&
+        http11c_req_query_get(req, "ack_consumer", ack_consumer,
+                              sizeof ack_consumer) == 1) {
+        if (!bjm_subject_valid(ack_subject) || !bjm_consumer_valid(ack_consumer)) {
+            res_err(res, 400, "invalid ack_subject or ack_consumer\n");
+            return;
+        }
+        int e = bjm_cursor_set(a->store, ack_subject, ack_consumer, ack_index);
+        if (e) { res_err(res, status_for(e), "ack failed\n"); return; }
+        /* The durability point of the pair: once this returns, the output
+         * is in its log and the input will not be replayed. */
+        bjm_cursor_sync(a->store);
+        acked = 1;
+    }
+
     bj_builder *b = a->bld;
     bj_builder_reset(b);
     bj_begin_object(b);
@@ -176,6 +211,10 @@ static void h_publish(http11c_request *req, http11c_response *res) {
     bj_put_string(b, (const uint8_t *)subject, (uint32_t)strlen(subject));
     bj_put_key(b, (const uint8_t *)"index", 5);
     bj_put_int(b, (int64_t)index);
+    if (acked) {
+        bj_put_key(b, (const uint8_t *)"acked", 5);
+        bj_put_int(b, (int64_t)ack_index);
+    }
     if (has_id) {
         /* True means "this id was already here" — the caller's retry did
          * not create a second message. */
@@ -848,7 +887,7 @@ static void h_not_found(http11c_request *req, http11c_response *res) {
     (void)req;
     res_err(res, 404,
         "no such route. available:\n"
-        "  POST   /pub/<subject>[?id=]\n"
+        "  POST   /pub/<subject>[?id=][&ack_subject=&ack_consumer=&ack_index=]\n"
         "  GET    /sub/<subject>?from=|consumer=\n"
         "  POST   /ack/<subject>?consumer=&index=\n"
         "  POST   /trim/<subject>?before=|keep=[&force=1]\n"

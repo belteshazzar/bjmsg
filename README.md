@@ -60,7 +60,7 @@ bare `curl` against a broken request is readable.
 
 | route | body / query | response |
 | --- | --- | --- |
-| `POST /pub/<subject>` | one binjson value, `?id=` | `{ subject, index, duplicate }` |
+| `POST /pub/<subject>` | one binjson value, `?id=&ack_subject=&ack_consumer=&ack_index=` | `{ subject, index, acked, duplicate }` |
 | `GET /sub/<subject>` | `?from=&max=` | ARRAY of `{ index, term, type, payload }` |
 | `GET /sub/<subject>` | `?consumer=&ack=&start=` | same, from the consumer's receipt |
 | `POST /ack/<subject>` | `?consumer=&index=` | `{ subject, consumer, acked }` |
@@ -169,6 +169,52 @@ BEGIN; insert result; update last_index = 42; COMMIT;   -- skip anything <= 42
 
 Exactly-once *delivery* is not a thing anyone can offer; this is the pair
 of mechanisms that gets you exactly-once *effect*.
+
+## Effectively-once pipelines
+
+`bjmsg pipe` reads a subject, transforms each message, and publishes the
+result to another — with the guarantee assembled rather than assumed:
+
+```sh
+bjmsg pipe orders --consumer enrich --to orders.enriched --exec ./enrich.sh
+```
+
+Two things make it hold. The output carries an **idempotency key derived
+from the input index** (`<consumer>.<subject>.<index>`), so rerunning a
+message produces the same key and collapses onto the output already
+there. And the publish **carries the input's acknowledgement with it** —
+one call, one response:
+
+```
+POST /pub/<out>?id=<key>&ack_subject=<in>&ack_consumer=<c>&ack_index=<n>
+```
+
+Those are still two writes to two files and cannot be one atomic write.
+The **order** is what carries the guarantee: publish, then ack. A crash in
+between replays the input, the handler reruns, and the republished output
+is deduplicated — so the effect is once. The other order would acknowledge
+an input whose output never landed, and lose the message.
+
+Measured, not assumed: 20 messages through a slow handler with the
+pipeline `kill -9`'d six times mid-stream produced **20 outputs, zero
+duplicates, zero missing**.
+
+The handler contract is a shell filter — payload on stdin, replacement on
+stdout, with `BJMSG_SUBJECT` / `BJMSG_CONSUMER` / `BJMSG_INDEX` in the
+environment. Empty stdout drops the message but still acknowledges it; a
+non-zero exit leaves it unacknowledged to be retried. `--raw` swaps the
+text rendering for encoded binjson on both sides, which is what preserves
+types through a pipeline.
+
+### Where this stops
+
+The broker can only join writes that are its own. If your handler's real
+effect is somewhere else — a database row, an HTTP call — no amount of
+broker machinery makes that atomic with the cursor. What you get there is
+at-least-once plus the tools to be idempotent: `BJMSG_INDEX` is stable and
+never shifts, so the handler can record it in the same transaction as its
+own output and skip anything it has already seen. That is the same
+pattern as above, with your store playing the part the broker plays here.
 
 ### The window
 

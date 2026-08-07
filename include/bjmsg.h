@@ -350,6 +350,7 @@ int bjm_cmd_fail(int argc, char **argv);
 int bjm_cmd_work(int argc, char **argv);
 int bjm_cmd_dead(int argc, char **argv);
 int bjm_cmd_requeue(int argc, char **argv);
+int bjm_cmd_pipe(int argc, char **argv);
 
 /* ---- rendering ------------------------------------------------------- */
 

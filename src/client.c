@@ -15,6 +15,7 @@
 
 #include <ctype.h>
 #include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
@@ -666,6 +667,7 @@ typedef struct {
     const char *consumer;
     const char *group;
     const char *exec;
+    const char *to;
     uint64_t    before, keep, index;
     uint64_t    max_age, max_messages, max_bytes;
     uint64_t    lease_ms;
@@ -676,6 +678,7 @@ typedef struct {
     int         max;
     long        retry_ms, interval_ms;
     int         force, clear, del, ignore_consumers;
+    int         raw, follow;
 } query_opts;
 
 /* Returns 0 on success, or an exit code (2) on a bad argument. */
@@ -724,6 +727,12 @@ static int query_parse(int argc, char **argv, query_opts *o, const char *usage) 
             if (!(o->group = arg_value(argc, argv, &i, "--group"))) return 2;
         } else if (strcmp(a, "--exec") == 0) {
             if (!(o->exec = arg_value(argc, argv, &i, "--exec"))) return 2;
+        } else if (strcmp(a, "--to") == 0) {
+            if (!(o->to = arg_value(argc, argv, &i, "--to"))) return 2;
+        } else if (strcmp(a, "--raw") == 0) {
+            o->raw = 1;
+        } else if (strcmp(a, "--follow") == 0 || strcmp(a, "-f") == 0) {
+            o->follow = 1;
         } else if (strcmp(a, "--max") == 0) {
             const char *v = arg_value(argc, argv, &i, "--max");
             if (!v) return 2;
@@ -1250,6 +1259,296 @@ int bjm_cmd_work(int argc, char **argv) {
 
     client_free(&c);
     return rc ? rc : (failures ? 1 : 0);
+}
+
+/* ---- effectively-once pipelines ---------------------------------------- */
+
+/*
+ * Run `cmd` with `in` on its stdin and collect its stdout.
+ *
+ * The input goes via a temporary file rather than a second pipe. Two
+ * pipes to one child deadlock as soon as the child writes more than a
+ * pipe buffer before reading all of its input, and avoiding that needs a
+ * poll loop for a case a message pipeline does not need. A file also
+ * keeps `cmd` a shell string, so --exec 'jq .field' works as written.
+ *
+ * Returns the child's exit code, or -1 if it could not be run or died on
+ * a signal.
+ */
+static int run_filter(const char *cmd, const uint8_t *in, size_t in_len,
+                      buf *out) {
+    char path[] = "/tmp/bjmsg-in-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return -1;
+    if (in_len && write(fd, in, in_len) != (ssize_t)in_len) {
+        close(fd); unlink(path); return -1;
+    }
+    close(fd);
+
+    /*
+     * The subshell is load-bearing. `CMD < file` binds the redirect to
+     * the last simple command, so `grep x || true` would leave grep
+     * reading the parent's stdin and hang; `( CMD ) < file` redirects
+     * the whole thing.
+     */
+    char line[2048];
+    if ((size_t)snprintf(line, sizeof line, "( %s ) < %s", cmd, path)
+            >= sizeof line) {
+        unlink(path); return -1;
+    }
+
+    FILE *child = popen(line, "r");
+    if (!child) { unlink(path); return -1; }
+
+    char chunk[8192];
+    size_t n;
+    out->len = 0;
+    while ((n = fread(chunk, 1, sizeof chunk, child)) > 0)
+        if (buf_append(out, chunk, n) != 0) break;
+
+    int status = pclose(child);
+    unlink(path);
+    /* pclose answers a wait status, not an exit code. */
+    if (status == -1 || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
+/* Appends a top-level STRING's value, not its rendering. */
+typedef struct { buf *out; int got; } str_peek;
+
+static void peek_string(void *ctx, const uint8_t *sv, uint32_t len) {
+    str_peek *p = ctx;
+    if (p->got) return;
+    buf_append(p->out, sv, len);
+    p->got = 1;
+}
+
+/*
+ * The bytes a handler should see for a message.
+ *
+ * `raw` hands over the encoded binjson untouched. Otherwise the message
+ * is rendered as text — except for a top-level STRING, where the handler
+ * gets the string's *value*. Handing it the rendering would pass on the
+ * quotes and the escaping too, so `tr a-z A-Z` over "hello" would come
+ * back as a string containing quote characters.
+ */
+static void feed_for(const uint8_t *payload, size_t plen, int raw, buf *out) {
+    out->len = 0;
+    if (raw) { buf_append(out, payload, plen); return; }
+
+    if (plen > 0 && payload[0] == BJ_TYPE_STRING) {
+        str_peek pk = { out, 0 };
+        bj_visitor v = bjm_visitor_noop(&pk);
+        v.on_string = peek_string;
+        if (bj_decode(payload, plen, &v, NULL) == BJ_OK && pk.got) return;
+        out->len = 0;
+    }
+
+    char *text = NULL;
+    size_t tlen = 0;
+    FILE *f = open_memstream(&text, &tlen);
+    if (f) {
+        bjm_render(f, payload, plen);
+        fclose(f);
+        buf_append(out, text, tlen);
+    }
+    free(text);
+}
+
+/* One input message: its index and its payload bytes, copied because the
+ * response buffer is reused by the next request. */
+typedef struct {
+    char      key[16];
+    long long index;
+    uint8_t  *payload;
+    size_t    plen;
+    int       have;
+} pipe_msg;
+
+static void pm_key(void *ctx, const uint8_t *k, uint32_t len) {
+    pipe_msg *m = ctx;
+    if (len >= sizeof m->key) len = sizeof m->key - 1;
+    memcpy(m->key, k, len);
+    m->key[len] = '\0';
+}
+
+static void pm_int(void *ctx, double v) {
+    pipe_msg *m = ctx;
+    if (!m->have && strcmp(m->key, "index") == 0) m->index = (long long)v;
+}
+
+static void pm_binary(void *ctx, const uint8_t *b, uint32_t len) {
+    pipe_msg *m = ctx;
+    if (m->have || strcmp(m->key, "payload") != 0) return;
+    m->payload = malloc(len ? len : 1);
+    if (!m->payload) return;
+    memcpy(m->payload, b, len);
+    m->plen = len;
+    m->have = 1;
+}
+
+#define PIPE_USAGE \
+    "usage: bjmsg pipe [--url URL] <in-subject> --consumer NAME\n" \
+    "                  --to <out-subject> --exec CMD [--raw] [--follow]\n" \
+    "                  [--interval MS]\n" \
+    "\n" \
+    "Read a subject, transform each message with CMD, publish the result\n" \
+    "to another subject. The publish and the input's acknowledgement\n" \
+    "happen in ONE broker call, and the output carries an idempotency key\n" \
+    "derived from the input index — so a crash anywhere in the loop\n" \
+    "replays the input and the rerun collapses onto the output that is\n" \
+    "already there. One input, one output, whatever fails.\n" \
+    "\n" \
+    "  --exec CMD   payload on stdin, replacement message on stdout;\n" \
+    "               empty stdout drops the message, a non-zero exit\n" \
+    "               leaves it unacknowledged to be retried\n" \
+    "  --raw        stdin and stdout are encoded binjson rather than the\n" \
+    "               rendered text form\n" \
+    "  --follow     keep polling once the input is drained\n"
+
+int bjm_cmd_pipe(int argc, char **argv) {
+    query_opts o;
+    int rc = query_parse(argc, argv, &o, PIPE_USAGE);
+    if (rc) return rc == 1 ? 0 : rc;
+    if (!o.subject || !bjm_subject_valid(o.subject) ||
+        !o.consumer || !bjm_consumer_valid(o.consumer) ||
+        !o.to || !bjm_subject_valid(o.to) || !o.exec) {
+        fputs(PIPE_USAGE, stderr);
+        return 2;
+    }
+    long idle = o.interval_ms > 0 ? o.interval_ms : DEFAULT_POLL_MS;
+
+    client c;
+    if (client_init(&c, o.retry_ms) != 0) return 1;
+
+    buf outbuf = {0};
+    bj_builder *bld = bj_builder_new();
+    if (!bld) { client_free(&c); return 1; }
+
+    rc = 0;
+    while (!g_stop) {
+        /* One at a time: the ack rides with the output, so a batch would
+         * have to be published before any of it could be acknowledged. */
+        char url[1024];
+        snprintf(url, sizeof url, "%s/sub/%s?consumer=%s&max=1",
+                 o.url_base, o.subject, o.consumer);
+        curl_easy_setopt(c.curl, CURLOPT_HTTPGET, 1L);
+        curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, NULL);
+
+        long status = client_perform(&c, url);
+        if (g_stop) break;
+        if (status < 0) { rc = 1; break; }
+        if (status != 200) {
+            if (status == 404 && o.follow) { sleep_ms(idle); continue; }
+            report_error(&c, status);
+            rc = 1;
+            break;
+        }
+
+        pipe_msg m;
+        memset(&m, 0, sizeof m);
+        bj_visitor v = bjm_visitor_noop(&m);
+        v.on_key = pm_key;
+        v.on_int = pm_int;
+        v.on_binary = pm_binary;
+        if (bj_decode(c.body.p, c.body.len, &v, NULL) != BJ_OK) {
+            fprintf(stderr, "bjmsg: malformed batch from broker\n");
+            rc = 1;
+            break;
+        }
+        if (!m.have) {
+            free(m.payload);
+            if (!o.follow) break;
+            sleep_ms(idle);
+            continue;
+        }
+
+        /* Hand the handler either the raw encoded message or its text
+         * rendering, and take its stdout back the same way. */
+        buf feed = {0};
+        feed_for(m.payload, m.plen, o.raw, &feed);
+
+        char env[32];
+        setenv("BJMSG_SUBJECT", o.subject, 1);
+        setenv("BJMSG_CONSUMER", o.consumer, 1);
+        snprintf(env, sizeof env, "%lld", m.index);
+        setenv("BJMSG_INDEX", env, 1);
+
+        int st = run_filter(o.exec, feed.p, feed.len, &outbuf);
+        buf_free(&feed);
+        free(m.payload);
+
+        if (st != 0) {
+            /* Not acknowledged, so the broker hands it back next poll. */
+            fprintf(stderr, "bjmsg: %lld failed (exit %d), not acknowledged\n",
+                    m.index, st);
+            rc = 1;
+            if (!o.follow) break;
+            sleep_ms(idle);
+            continue;
+        }
+
+        /*
+         * Deterministic from the input, NOT from the output: rerunning a
+         * handler that is not perfectly deterministic must still collapse
+         * onto the message its first run produced.
+         */
+        char id[BJM_DEDUP_ID_MAX + 1];
+        snprintf(id, sizeof id, "%s.%s.%lld", o.consumer, o.subject, m.index);
+
+        if (outbuf.len == 0) {
+            /* Nothing to publish — the handler dropped it. Acknowledge on
+             * its own so the input still makes progress. */
+            snprintf(url, sizeof url, "%s/ack/%s?consumer=%s&index=%lld",
+                     o.url_base, o.subject, o.consumer, m.index);
+            curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, "POST");
+            curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, "");
+            curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, 0L);
+            if (client_perform(&c, url) != 200) { rc = 1; break; }
+            printf("%lld\tdropped\n", m.index);
+            fflush(stdout);
+            continue;
+        }
+
+        const uint8_t *body = outbuf.p;
+        size_t body_len = outbuf.len;
+        if (!o.raw) {
+            /* Text out becomes a binjson STRING, trailing newline and all
+             * removed — a shell filter almost always adds one. */
+            size_t n = outbuf.len;
+            while (n > 0 && (outbuf.p[n - 1] == '\n' || outbuf.p[n - 1] == '\r')) n--;
+            bj_builder_reset(bld);
+            bj_put_string(bld, outbuf.p, (uint32_t)n);
+            body = bj_builder_data(bld, &body_len);
+            if (!body) { rc = 1; break; }
+        }
+
+        snprintf(url, sizeof url,
+                 "%s/pub/%s?id=%s&ack_subject=%s&ack_consumer=%s&ack_index=%lld",
+                 o.url_base, o.to, id, o.subject, o.consumer, m.index);
+        curl_easy_setopt(c.curl, CURLOPT_CUSTOMREQUEST, NULL);
+        curl_easy_setopt(c.curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, body);
+        curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, (long)body_len);
+        if (!c.headers) {
+            c.headers = curl_slist_append(NULL, "Content-Type: " BJMSG_MEDIA_TYPE);
+            curl_easy_setopt(c.curl, CURLOPT_HTTPHEADER, c.headers);
+        }
+
+        status = client_perform(&c, url);
+        if (status != 200) {
+            if (status > 0) report_error(&c, status);
+            rc = 1;
+            break;
+        }
+        printf("%lld\t->\t%s\n", m.index, o.to);
+        fflush(stdout);
+    }
+
+    bj_builder_free(bld);
+    buf_free(&outbuf);
+    client_free(&c);
+    return rc;
 }
 
 /* ---- the dead-letter channel ------------------------------------------- */
