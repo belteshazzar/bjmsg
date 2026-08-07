@@ -5,6 +5,11 @@
 # only messages published while this subscriber is running are delivered,
 # so the log's backlog is skipped.
 #
+# Nothing here polls. `bjmsg sub` starts a small HTTP server of its own,
+# tells the broker to POST matching messages to it, and prints them as
+# they land — so a message shows up in well under a millisecond rather
+# than on the next tick of a poll.
+#
 # DURABLE=1 switches to a read-receipt subscription instead: the broker
 # persists how far this subscriber has acknowledged, so stopping it and
 # starting it again delivers exactly what it missed. --tail then only
@@ -20,10 +25,10 @@ COLOUR_CODE="${2:-36}"
 if [ -t 1 ]; then COLOUR=$'\033['"$COLOUR_CODE"'m'; else COLOUR=''; fi
 
 if [ "${DURABLE:-0}" = "1" ]; then
-    SUB_ARGS=(--consumer "$NAME" --tail --follow --interval 100)
+    SUB_ARGS=(--consumer "$NAME" --tail)
     MODE="durable — receipts persisted as ${C_BOLD}$NAME${C_RESET}${C_DIM}, resumes where it left off"
 else
-    SUB_ARGS=(--tail --follow --interval 100)
+    SUB_ARGS=(--tail)
     MODE="ephemeral — only what is published from now on"
 fi
 
@@ -31,9 +36,10 @@ echo "${COLOUR}${C_BOLD}[$NAME]${C_RESET} $(now) Subscribing on ${C_BOLD}$SUBJEC
 echo "${C_DIM}${MODE}${C_RESET}"
 echo "${C_DIM}Ctrl-C to stop.${C_RESET}"
 
-# In ephemeral mode the broker holds no subscriber state at all: the
-# cursor travels in each request. In durable mode it holds one number per
-# subscriber, and the ack rides along with the next poll.
+# The broker keeps one number per subscriber either way — how far it has
+# acknowledged. The difference is what happens on exit: an ephemeral
+# subscription takes its position with it, a durable one leaves it behind
+# to resume from.
 "$BJMSG" sub --url "$URL" "$SUBJECT" "${SUB_ARGS[@]}" |
 while IFS=$'\t' read -r index payload; do
     printf '%s%s[%s]%s %s [#%s] Received on "%s"\n  %s\n' \

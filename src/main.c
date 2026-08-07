@@ -26,7 +26,7 @@ static void usage(void) {
         "                    [--dedup-window SECONDS]\n"
         "  bjmsg pub         [--url URL] <subject> (<text> | --int N | --file PATH)\n"
         "  bjmsg sub         [--url URL] <subject> [--consumer NAME] [--tail]\n"
-        "                    [--from N] [--follow]\n"
+        "                    [--port N] [--callback URL] [--exec CMD] [--keep]\n"
         "\n"
         "job queues (each message goes to one group member):\n"
         "  bjmsg work        [--url URL] <subject> --group G --exec CMD\n"
@@ -42,6 +42,7 @@ static void usage(void) {
         "\n"
         "query a running broker and exit:\n"
         "  bjmsg health      [--url URL]\n"
+        "  bjmsg push        [--url URL] [--consumer NAME --delete]\n"
         "  bjmsg subjects    [--url URL]\n"
         "  bjmsg info        [--url URL] <subject>\n"
         "  bjmsg consumers   [--url URL] <subject>\n"
@@ -50,6 +51,9 @@ static void usage(void) {
         "  bjmsg seek        [--url URL] <subject> --consumer NAME --index N\n"
         "  bjmsg policy      [--url URL] [<subject> [--max-age D]\n"
         "                    [--max-messages N] [--max-bytes S] [--clear]]\n"
+        "\n"
+        "`sub` receives rather than polls: it starts a small HTTP server and\n"
+        "registers it as the callback the broker POSTs messages to.\n"
         "\n"
         "A --consumer subscription is durable: the broker persists a read\n"
         "receipt, so rejoining resumes after the last acknowledged message.\n"
@@ -92,16 +96,26 @@ int main(int argc, char **argv) {
         usage();
         return 0;
     }
-    if (strcmp(cmd, "serve") == 0) return cmd_serve(rest_argc, rest_argv);
+    /* Both halves need libcurl's global state now: the broker is an HTTP
+     * client too, because that is how it delivers to a callback. */
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+        fprintf(stderr, "bjmsg: curl_global_init failed\n");
+        return 1;
+    }
 
-    /* The client subcommands need libcurl's global state; the server
-     * never touches libcurl, so it does not pay for this. */
+    if (strcmp(cmd, "serve") == 0) {
+        int rc = cmd_serve(rest_argc, rest_argv);
+        curl_global_cleanup();
+        return rc;
+    }
+
     static const struct {
         const char *name;
         int (*run)(int, char **);
     } clients[] = {
         { "pub",         bjm_cmd_pub },
         { "sub",         bjm_cmd_sub },
+        { "push",        bjm_cmd_push },
         { "health",      bjm_cmd_health },
         { "subjects",    bjm_cmd_subjects },
         { "info",        bjm_cmd_info },
@@ -124,15 +138,12 @@ int main(int argc, char **argv) {
 
     for (size_t i = 0; i < sizeof clients / sizeof *clients; i++) {
         if (strcmp(cmd, clients[i].name) != 0) continue;
-        if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
-            fprintf(stderr, "bjmsg: curl_global_init failed\n");
-            return 1;
-        }
         int rc = clients[i].run(rest_argc, rest_argv);
         curl_global_cleanup();
         return rc;
     }
 
+    curl_global_cleanup();
     fprintf(stderr, "bjmsg: unknown command '%s'\n\n", cmd);
     usage();
     return 2;

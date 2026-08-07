@@ -73,25 +73,30 @@ ephemeral, and only alice catches up after a restart.
 
 Ctrl-C terminal 1 and start it again. The subscribers report that they
 cannot reach it, retry every 5 s, and carry on where they left off once it
-is back — durable ones from their receipt, ephemeral ones from the cursor
-they hold. Nothing else needs restarting.
+is back. The subscriptions themselves are stored in the broker, so it
+reads them back on start and resumes delivering. Nothing else needs
+restarting.
 
 ## Where this differs from NATS
 
-- **Subscribers poll.** http11c cannot hold a response open, so
-  `bjmsg sub` re-asks on a kept-alive connection every 100 ms. Delivery
-  looks instant at human speed; mean latency is ~50 ms.
+- **Subscribers are HTTP servers.** `bjmsg sub` starts one, registers it
+  as a callback, and the broker POSTs to it — so the connection runs from
+  broker to subscriber, and delivery takes well under a millisecond. The
+  reply to that POST is the acknowledgement; there is no second request.
+  What it costs is reachability: the broker has to be able to dial the
+  subscriber.
 - **The backlog is real, and opt-in.** NATS core drops a message with no
   active subscriber. Here every message is durable in the subject's entry
   log, and the demo passes `--tail` to *choose* NATS's behaviour. Drop
   `--tail` from `_subscriber.sh` and a subscriber replays the subject from
   message 1 — including messages published before it existed.
-- **The cursor belongs to the subscriber, unless you ask otherwise.** By
-  default the broker keeps no per-subscriber state at all — `--from`
-  travels in each request. `DURABLE=1` moves the cursor to the broker as a
-  persisted read receipt, which is closer to a JetStream durable consumer
-  than to NATS core.
-- **One subject per subscription.** No `greet.*` wildcards yet.
+- **Positions live in the broker, and outlive the subscriber if you name
+  it.** An unnamed subscription takes its position with it when it stops;
+  `DURABLE=1` gives it a name, and the receipt stays behind to resume
+  from — closer to a JetStream durable consumer than to NATS core.
+- **Wildcards are matched in the broker.** `bjmsg sub 'greet.>'` is one
+  registration, and a subject created later is delivered from its first
+  message.
 
 ## Configuration
 

@@ -10,6 +10,7 @@
 #include "bjmsg.h"
 
 #include "binjson.h"
+#include "http11c.h"
 
 #include <curl/curl.h>
 
@@ -479,178 +480,320 @@ static void s_binary(void *ctx, const uint8_t *bytes, uint32_t len) {
 static void sub_usage(void) {
     fprintf(stderr,
         "usage: bjmsg sub [--url URL] <subject|pattern> [--consumer NAME]\n"
-        "                 [--from N | --tail] [--follow] [--interval MS]\n"
-        "                 [--retry MS] [--max BYTES]\n"
+        "                 [--port N] [--bind ADDR] [--callback URL] [--token T]\n"
+        "                 [--tail | --from N] [--exec CMD] [--keep]\n"
+        "                 [--retry MS] [--batch BYTES] [--heartbeat MS]\n"
         "\n"
-        "  <pattern>     'orders.*' follows one token, 'orders.>' follows\n"
-        "                that and everything below. Each matched subject\n"
-        "                keeps its own cursor, and output gains a subject\n"
-        "                column. New matches are picked up as they appear.\n"
-        "  --consumer N  durable subscription: the broker remembers how far\n"
-        "                NAME has read, so rejoining delivers only what it\n"
-        "                has not acknowledged. Overrides --from.\n"
-        "  --from N      start at index N (default 1, the first message)\n"
-        "  --tail        skip the backlog: start after the last message that\n"
-        "                exists when the subscription starts. With\n"
-        "                --consumer this only sets where a new consumer joins.\n"
-        "  --follow      keep polling after catching up\n"
-        "  --interval MS poll interval once caught up (default 200)\n"
-        "  --retry MS    wait MS between attempts when the broker cannot be\n"
-        "                reached, so a subscription survives a broker\n"
-        "                restart (default 5000; 0 disables retrying)\n");
+        "Messages are pushed, not polled: this starts a small HTTP server,\n"
+        "tells the broker to POST matching messages to it, and prints them\n"
+        "as they arrive. Nothing asks the broker whether there is anything\n"
+        "new — it says so, over the connection it keeps open for the purpose.\n"
+        "\n"
+        "  <pattern>      'orders.*' takes one token, 'orders.>' takes that\n"
+        "                 and everything below. Output gains a subject column,\n"
+        "                 and subjects created later are picked up with no\n"
+        "                 re-resolving: the broker already knows about them.\n"
+        "  --consumer N   durable subscription: the broker keeps a receipt for\n"
+        "                 NAME, so rejoining delivers only what it has not\n"
+        "                 acknowledged. Without it a throwaway name is used\n"
+        "                 and the subscription is removed on exit.\n"
+        "  --port N       port to receive on (default: any free one)\n"
+        "  --bind ADDR    address to receive on (default: the local address\n"
+        "                 this host reaches the broker from)\n"
+        "  --callback URL what to tell the broker to POST to, when that is not\n"
+        "                 simply where we are listening — a port forward, a\n"
+        "                 NAT, a proxy in front\n"
+        "  --token T      shared secret the broker sends back on every\n"
+        "                 delivery (default: a fresh random one)\n"
+        "  --tail         only messages published from now on\n"
+        "  --from N       start at index N. Both apply only when the\n"
+        "                 subscription is new; an existing one keeps its place.\n"
+        "  --exec CMD     run CMD per message with the payload on stdin\n"
+        "                 instead of printing. A non-zero exit refuses the\n"
+        "                 message, and the broker redelivers it.\n"
+        "  --keep         leave the subscription registered on exit, so the\n"
+        "                 broker keeps queueing for it\n"
+        "  --batch BYTES  how much the broker may send per delivery\n"
+        "  --heartbeat MS re-register this often, so the subscription heals\n"
+        "                 itself if the broker forgot it (default 30000; 0\n"
+        "                 disables). This is liveness, not polling: it never\n"
+        "                 asks for messages.\n"
+        "  --retry MS     wait MS between attempts when the broker cannot be\n"
+        "                 reached (default 5000; 0 disables retrying)\n");
 }
 
+/* ---- sub: receiving pushed messages ------------------------------------ */
+
+static void feed_for(const uint8_t *payload, size_t plen, int raw, buf *out);
+
 /*
- * One subject a subscription is following. A plain subject makes a list
- * of one; a pattern makes one per match, each with its own cursor —
- * which is the whole trick, since subjects have independent index
- * spaces and there is no order across them.
+ * The state one delivery is decoded against. The broker POSTs the same
+ * ARRAY of { index, term, type, payload } that GET /sub returns, so this
+ * is the same decode the polling subscriber used to do — only the
+ * direction of the connection changed.
  */
 typedef struct {
-    char     subject[BJM_SUBJECT_MAX + 1];
-    uint64_t from;         /* ephemeral cursor */
-    uint64_t pending_ack;  /* durable: delivered but not yet acknowledged */
-    uint64_t acked;        /* the broker's receipt, from X-Bjmsg-Acked */
-    int      tail;         /* still owes its "where does this end" probe */
-} sub_target;
+    char        key[16];
+    long long   index;
+    const char *subject;      /* printed first when following a pattern */
+    const char *exec;         /* handler command, or NULL to print */
+    buf         feed;         /* what the handler gets on stdin */
+    uint64_t    took;         /* highest index accepted so far */
+    int         count;
+    int         stopped;      /* a handler failed; refuse the rest */
+} delivery;
 
-#define POLL_OK    0
-#define POLL_ABSENT -1     /* 404: no such subject (yet) */
-#define POLL_FATAL -2
-
-/* Poll one subject once, printing whatever came back. Returns the number
- * of messages, or POLL_ABSENT / POLL_FATAL. */
-static int poll_target(client *c, const char *url_base, sub_target *t,
-                       const char *consumer, uint64_t max_bytes,
-                       int show_subject) {
-    char url[1024];
-    if (consumer) {
-        int n = snprintf(url, sizeof url, "%s/sub/%s?consumer=%s&max=%llu",
-                         url_base, t->subject, consumer,
-                         (unsigned long long)max_bytes);
-        /* Piggyback the receipt for the previous batch: the broker
-         * persists it before choosing what to send next, so this costs
-         * no extra round trip. */
-        if (t->pending_ack && n > 0 && (size_t)n < sizeof url)
-            n += snprintf(url + n, sizeof url - n, "&ack=%llu",
-                          (unsigned long long)t->pending_ack);
-        if (t->tail && n > 0 && (size_t)n < sizeof url)
-            snprintf(url + n, sizeof url - n, "&start=last");
-    } else {
-        snprintf(url, sizeof url, "%s/sub/%s?from=%llu&max=%llu",
-                 url_base, t->subject, (unsigned long long)t->from,
-                 (unsigned long long)max_bytes);
-    }
-
-    long status = client_perform(c, url);
-    if (g_stop) return POLL_FATAL;
-    if (status < 0) return POLL_FATAL;
-    if (status == 404) {
-        /* Absent is not an error: with --tail there is no backlog to
-         * skip, so the first message published is the first one wanted. */
-        if (t->tail) { t->tail = 0; t->from = 1; }
-        return POLL_ABSENT;
-    }
-    if (status != 200) {
-        report_error(c, status);
-        return POLL_FATAL;
-    }
-
-    if (c->skipped) {
-        fprintf(stderr, "bjmsg: %s: %llu message(s) had already been "
-                        "trimmed; starting at the oldest one kept\n",
-                t->subject, (unsigned long long)c->skipped);
-        c->skipped = 0;
-    }
-
-    sub_scan s = {0};
-    s.next = t->from;
-    s.subject = show_subject ? t->subject : NULL;
-    bj_visitor v = bjm_visitor_noop(&s);
-    v.on_int = s_int;
-    v.on_binary = s_binary;
-    v.on_key = s_key;
-    if (bj_decode(c->body.p, c->body.len, &v, NULL) != BJ_OK) {
-        fprintf(stderr, "bjmsg: malformed batch from broker\n");
-        return POLL_FATAL;
-    }
-
-    if (t->tail && !consumer) {
-        /* The probe told us where the log ends; start just past it. */
-        t->from = c->last_index + 1;
-        t->tail = 0;
-        return 0;
-    }
-    t->tail = 0;
-    if (s.count > 0) t->pending_ack = s.next - 1;
-    t->acked = c->acked;
-    t->from = s.next;
-    return s.count;
+static void dv_key(void *ctx, const uint8_t *k, uint32_t len) {
+    delivery *d = ctx;
+    if (len >= sizeof d->key) len = sizeof d->key - 1;
+    memcpy(d->key, k, len);
+    d->key[len] = '\0';
 }
 
-/* Collect the strings of a binjson ARRAY. */
-typedef struct { sub_target **list; int *n, *cap; uint64_t from; int tail; } resolver;
+static void dv_int(void *ctx, double v) {
+    delivery *d = ctx;
+    if (strcmp(d->key, "index") == 0) d->index = (long long)v;
+}
 
-static void rv_string(void *ctx, const uint8_t *v, uint32_t len) {
-    resolver *r = ctx;
-    if (len > BJM_SUBJECT_MAX) return;
-    char name[BJM_SUBJECT_MAX + 1];
-    memcpy(name, v, len);
-    name[len] = '\0';
+/* Feed one message to CMD's stdin. Non-zero means the message was not
+ * handled, which becomes a partial ack and a redelivery. */
+static int run_handler(const char *cmd, const uint8_t *data, size_t len) {
+    FILE *f = popen(cmd, "w");
+    if (!f) return -1;
+    if (len) fwrite(data, 1, len, f);
+    fputc('\n', f);
+    int st = pclose(f);
+    if (st == -1) return -1;
+    return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : 1;
+}
 
-    for (int i = 0; i < *r->n; i++)
-        if (strcmp((*r->list)[i].subject, name) == 0) return;   /* known */
+static void dv_binary(void *ctx, const uint8_t *bytes, uint32_t len) {
+    delivery *d = ctx;
+    if (strcmp(d->key, "payload") != 0) return;
+    /*
+     * binjson decodes a value to the end; there is no aborting from a
+     * visitor. So a failed handler does not stop the walk, it stops the
+     * *accepting* — every message after it is left untaken and the
+     * broker sends them again, in order, next time.
+     */
+    if (d->stopped) return;
 
-    if (*r->n == *r->cap) {
-        int cap = *r->cap ? *r->cap * 2 : 8;
-        sub_target *p = realloc(*r->list, (size_t)cap * sizeof *p);
-        if (!p) return;
-        *r->list = p;
-        *r->cap = cap;
+    if (d->exec) {
+        feed_for(bytes, len, 0, &d->feed);
+        if (run_handler(d->exec, d->feed.p, d->feed.len) != 0) {
+            fprintf(stderr, "bjmsg: handler failed on %s%s#%lld — "
+                            "refusing it and everything after\n",
+                    d->subject ? d->subject : "", d->subject ? " " : "",
+                    d->index);
+            d->stopped = 1;
+            return;
+        }
+    } else {
+        if (d->subject) printf("%s\t", d->subject);
+        printf("%lld\t", d->index);
+        if (bjm_render(stdout, bytes, len) != BJ_OK)
+            fputs("<undecodable>", stdout);
+        fputc('\n', stdout);
+        fflush(stdout);
     }
-    sub_target *t = &(*r->list)[(*r->n)++];
-    memset(t, 0, sizeof *t);
-    snprintf(t->subject, sizeof t->subject, "%s", name);
-    t->from = r->from;
-    t->tail = r->tail;
+    d->took = (uint64_t)d->index;
+    d->count++;
+}
+
+/* What the receiver serves. */
+typedef struct {
+    char      path[64];
+    char      token[BJM_TOKEN_MAX + 1];
+    const char *exec;
+    int       show_subject;
+    uint64_t  messages;
+    uint64_t  deliveries;
+} receiver;
+
+static void h_deliver(http11c_request *req, http11c_response *res) {
+    receiver *r = http11c_req_ctx(req);
+
+    /*
+     * The token proves the POST came from the broker we registered with.
+     * It is the only thing that does: anyone who can reach this port can
+     * connect to it, and a subscriber that took whatever arrived would
+     * accept messages from anywhere.
+     */
+    if (r->token[0]) {
+        const char *auth = http11c_req_header(req, "Authorization");
+        char want[BJM_TOKEN_MAX + 16];
+        snprintf(want, sizeof want, "Bearer %s", r->token);
+        if (!auth || strcmp(auth, want) != 0) {
+            http11c_res_header(res, "Content-Type", "text/plain");
+            http11c_res_text(res, 401, "bad or missing bearer token\n");
+            return;
+        }
+    }
+
+    const char *subject = http11c_req_header(req, "X-Bjmsg-Subject");
+    size_t len = 0;
+    const uint8_t *body = (const uint8_t *)http11c_req_body(req, &len);
+    if (!body || len == 0) {
+        http11c_res_header(res, "Content-Type", "text/plain");
+        http11c_res_text(res, 400, "empty delivery\n");
+        return;
+    }
+
+    delivery d;
+    memset(&d, 0, sizeof d);
+    d.subject = r->show_subject ? subject : NULL;
+    d.exec = r->exec;
+
+    bj_visitor v = bjm_visitor_noop(&d);
+    v.on_key = dv_key;
+    v.on_int = dv_int;
+    v.on_binary = dv_binary;
+    int e = bj_decode(body, len, &v, NULL);
+    buf_free(&d.feed);
+
+    if (e != BJ_OK) {
+        http11c_res_header(res, "Content-Type", "text/plain");
+        http11c_res_text(res, 400, "malformed delivery\n");
+        return;
+    }
+
+    r->messages += (uint64_t)d.count;
+    r->deliveries++;
+
+    /*
+     * The reply is the acknowledgement. X-Bjmsg-Ack says how far we got,
+     * which is the whole batch when every handler succeeded and less when
+     * one did not — 0 meaning we took none of it, which the broker reads
+     * as "not now" and retries with a backoff rather than immediately.
+     */
+    char ack[32];
+    snprintf(ack, sizeof ack, "%llu", (unsigned long long)d.took);
+    http11c_res_header(res, "X-Bjmsg-Ack", ack);
+    http11c_res_header(res, "Content-Type", "text/plain");
+    http11c_res_text(res, 200, "");
 }
 
 /*
- * Add any newly matching subjects to the list, keeping the cursors of
- * those already there. Subjects are created at any time, so a pattern
- * has to be re-asked periodically rather than resolved once.
+ * Where the broker should send. By default: wherever this host talks to
+ * the broker from — ask libcurl what local address the connection to it
+ * actually used. That is the address the broker's replies already come
+ * back to, so it is the one most likely to work, and finding it costs
+ * nothing because the registration has to connect anyway.
+ *
+ * It also means the receiver binds to exactly that address rather than
+ * to everything, which is a smaller thing to leave open than 0.0.0.0.
  */
-static int resolve_pattern(client *c, const char *url_base, const char *pattern,
-                           sub_target **list, int *n, int *cap,
-                           uint64_t from, int tail) {
-    char *esc = curl_easy_escape(c->curl, pattern, 0);
-    if (!esc) return -1;
+static int probe_local_ip(client *c, const char *url_base,
+                          char *out, size_t cap) {
     char url[1024];
-    snprintf(url, sizeof url, "%s/subjects?pattern=%s", url_base, esc);
-    curl_free(esc);
-
+    snprintf(url, sizeof url, "%s/health", url_base);
     curl_easy_setopt(c->curl, CURLOPT_HTTPGET, 1L);
     curl_easy_setopt(c->curl, CURLOPT_CUSTOMREQUEST, NULL);
-    long status = client_perform(c, url);
-    if (status != 200) return -1;
+    if (client_perform(c, url) != 200) return -1;
 
-    resolver r = { list, n, cap, from, tail };
-    bj_visitor v = bjm_visitor_noop(&r);
-    v.on_string = rv_string;
-    return bj_decode(c->body.p, c->body.len, &v, NULL) == BJ_OK ? 0 : -1;
+    char *ip = NULL;
+    if (curl_easy_getinfo(c->curl, CURLINFO_LOCAL_IP, &ip) != CURLE_OK ||
+        !ip || !*ip)
+        return -1;
+    snprintf(out, cap, "%s", ip);
+    return 0;
 }
 
-/* How often a pattern is re-asked for newly created subjects. */
-#define RESOLVE_EVERY_MS 3000
+/* Random hex, for a name or a token nobody has to choose. */
+static int random_hex(char *out, size_t bytes) {
+    unsigned char raw[32];
+    if (bytes > sizeof raw) bytes = sizeof raw;
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) return -1;
+    size_t n = fread(raw, 1, bytes, f);
+    fclose(f);
+    if (n != bytes) return -1;
+    for (size_t i = 0; i < bytes; i++)
+        snprintf(out + i * 2, 3, "%02x", raw[i]);
+    return 0;
+}
+
+/* An IPv6 literal needs brackets before it can carry a port. */
+static void host_for_url(const char *ip, char *out, size_t cap) {
+    if (strchr(ip, ':')) snprintf(out, cap, "[%s]", ip);
+    else                 snprintf(out, cap, "%s", ip);
+}
+
+/*
+ * Register (or re-register) the subscription. A PUT is idempotent here on
+ * purpose: repeating it moves the callback and leaves the receipt alone,
+ * which is what lets a subscriber that restarted on a new port simply say
+ * so, and what makes the heartbeat below safe to send at any time.
+ */
+static long push_register(client *c, const char *url_base, const char *pattern,
+                          const char *consumer, const char *callback,
+                          const char *token, uint64_t batch,
+                          int tail, uint64_t from) {
+    char *esc_cb = curl_easy_escape(c->curl, callback, 0);
+    if (!esc_cb) return -1;
+
+    char url[2048];
+    int n = snprintf(url, sizeof url, "%s/push/%s?consumer=%s&callback=%s",
+                     url_base, pattern, consumer, esc_cb);
+    curl_free(esc_cb);
+    if (n < 0 || (size_t)n >= sizeof url) return -1;
+
+    if (token && *token)
+        n += snprintf(url + n, sizeof url - n, "&token=%s", token);
+    if (batch)
+        n += snprintf(url + n, sizeof url - n, "&batch=%llu",
+                      (unsigned long long)batch);
+    if (tail)
+        n += snprintf(url + n, sizeof url - n, "&start=last");
+    else if (from > 1)
+        snprintf(url + n, sizeof url - n, "&from=%llu",
+                 (unsigned long long)from);
+
+    curl_easy_setopt(c->curl, CURLOPT_HTTPGET, 0L);
+    curl_easy_setopt(c->curl, CURLOPT_POSTFIELDS, "");
+    curl_easy_setopt(c->curl, CURLOPT_POSTFIELDSIZE, 0L);
+    curl_easy_setopt(c->curl, CURLOPT_CUSTOMREQUEST, "PUT");
+    return client_perform(c, url);
+}
+
+/*
+ * `purge` also discards the receipts, which is right for a throwaway
+ * subscription and wrong for a named one: a durable consumer unregisters
+ * on every shutdown, and losing its position would replay the log.
+ */
+static long push_unregister(client *c, const char *url_base,
+                            const char *consumer, int purge) {
+    char url[1024];
+    snprintf(url, sizeof url, "%s/push?consumer=%s%s", url_base, consumer,
+             purge ? "&purge=1" : "");
+    curl_easy_setopt(c->curl, CURLOPT_HTTPGET, 0L);
+    curl_easy_setopt(c->curl, CURLOPT_POSTFIELDS, "");
+    curl_easy_setopt(c->curl, CURLOPT_POSTFIELDSIZE, 0L);
+    curl_easy_setopt(c->curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    return client_perform(c, url);
+}
+
+/*
+ * How often the subscription is re-asserted. Not a poll: it carries no
+ * cursor and asks for nothing, it only re-states where to deliver. What
+ * it buys is self-healing — a broker whose store was rebuilt has no
+ * record of us, and nothing else would ever tell us that.
+ */
+#define DEFAULT_HEARTBEAT_MS 30000
+#define RECEIVER_IDLE_TIMEOUT_SECS 300
 
 int bjm_cmd_sub(int argc, char **argv) {
     const char *url_base = DEFAULT_URL;
     const char *subject = NULL;
     const char *consumer = NULL;
-    uint64_t from = 1, max_bytes = 65536;
-    long interval = DEFAULT_POLL_MS;
+    const char *bind_addr = NULL;
+    const char *callback = NULL;
+    const char *token = NULL;
+    const char *exec_cmd = NULL;
+    uint64_t from = 1, batch = 0;
     long retry_ms = DEFAULT_RETRY_MS;
-    int follow = 0, tail = 0;
+    long heartbeat_ms = DEFAULT_HEARTBEAT_MS;
+    int port = 0, tail = 0, keep = 0;
 
     for (int i = 0; i < argc; i++) {
         const char *a = argv[i];
@@ -658,18 +801,26 @@ int bjm_cmd_sub(int argc, char **argv) {
             if (!(consumer = arg_value(argc, argv, &i, "--consumer"))) return 2;
         } else if (strcmp(a, "--url") == 0) {
             if (!(url_base = arg_value(argc, argv, &i, "--url"))) return 2;
+        } else if (strcmp(a, "--bind") == 0) {
+            if (!(bind_addr = arg_value(argc, argv, &i, "--bind"))) return 2;
+        } else if (strcmp(a, "--callback") == 0) {
+            if (!(callback = arg_value(argc, argv, &i, "--callback"))) return 2;
+        } else if (strcmp(a, "--token") == 0) {
+            if (!(token = arg_value(argc, argv, &i, "--token"))) return 2;
+        } else if (strcmp(a, "--exec") == 0) {
+            if (!(exec_cmd = arg_value(argc, argv, &i, "--exec"))) return 2;
+        } else if (strcmp(a, "--port") == 0) {
+            const char *v = arg_value(argc, argv, &i, "--port");
+            if (!v) return 2;
+            port = atoi(v);
         } else if (strcmp(a, "--from") == 0) {
             const char *v = arg_value(argc, argv, &i, "--from");
             if (!v) return 2;
             from = strtoull(v, NULL, 10);
-        } else if (strcmp(a, "--max") == 0) {
-            const char *v = arg_value(argc, argv, &i, "--max");
+        } else if (strcmp(a, "--batch") == 0) {
+            const char *v = arg_value(argc, argv, &i, "--batch");
             if (!v) return 2;
-            max_bytes = strtoull(v, NULL, 10);
-        } else if (strcmp(a, "--interval") == 0) {
-            const char *v = arg_value(argc, argv, &i, "--interval");
-            if (!v) return 2;
-            interval = strtol(v, NULL, 10);
+            batch = strtoull(v, NULL, 10);
         } else if (strcmp(a, "--retry") == 0) {
             const char *v = arg_value(argc, argv, &i, "--retry");
             if (!v || parse_ms(v, &retry_ms) != 0) {
@@ -677,10 +828,30 @@ int bjm_cmd_sub(int argc, char **argv) {
                                 "(0 to disable)\n");
                 return 2;
             }
-        } else if (strcmp(a, "--follow") == 0 || strcmp(a, "-f") == 0) {
-            follow = 1;
+        } else if (strcmp(a, "--heartbeat") == 0) {
+            const char *v = arg_value(argc, argv, &i, "--heartbeat");
+            if (!v || parse_ms(v, &heartbeat_ms) != 0) {
+                fprintf(stderr, "bjmsg: --heartbeat needs a millisecond "
+                                "count (0 to disable)\n");
+                return 2;
+            }
         } else if (strcmp(a, "--tail") == 0) {
             tail = 1;
+        } else if (strcmp(a, "--keep") == 0) {
+            keep = 1;
+        } else if (strcmp(a, "--follow") == 0 || strcmp(a, "-f") == 0) {
+            /* Accepted and unnecessary: a pushed subscription always
+             * follows. There is nothing to catch up to and stop at. */
+        } else if (strcmp(a, "--interval") == 0 || strcmp(a, "--max") == 0) {
+            const char *v = arg_value(argc, argv, &i, a);
+            if (!v) return 2;
+            if (strcmp(a, "--max") == 0) {
+                batch = strtoull(v, NULL, 10);
+            } else {
+                fprintf(stderr, "bjmsg: --interval no longer does anything — "
+                                "messages are pushed, so there is no poll to "
+                                "pace\n");
+            }
         } else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
             sub_usage();
             return 0;
@@ -706,116 +877,148 @@ int bjm_cmd_sub(int argc, char **argv) {
         fprintf(stderr, "bjmsg: invalid consumer '%s'\n", consumer);
         return 2;
     }
-    if (from == 0) from = 1;
+    if (callback && !bjm_callback_valid(callback)) {
+        fprintf(stderr, "bjmsg: --callback must be an http:// or https:// "
+                        "URL of printable, space-free characters\n");
+        return 2;
+    }
+    if (token && !bjm_token_valid(token)) {
+        fprintf(stderr, "bjmsg: --token must be up to %d printable, "
+                        "space-free bytes\n", BJM_TOKEN_MAX);
+        return 2;
+    }
+
     /*
-     * --tail asks a cursor past the end of the log, which the broker
-     * answers with an empty batch plus the real last index — so the
-     * probe costs nothing, delivers nothing, and says where to start.
-     * With --consumer the broker owns the cursor, so --tail becomes
-     * ?start=last and only decides where a new consumer joins.
+     * Without --consumer the subscription is a throwaway: a name nobody
+     * else will use, removed on the way out. With one it is durable, and
+     * the broker keeps queueing while this process is not running.
      */
-    uint64_t start_from = (tail && !consumer) ? UINT64_MAX : from;
+    char generated[BJM_CONSUMER_MAX + 1];
+    int ephemeral = (consumer == NULL);
+    if (ephemeral) {
+        char hex[17];
+        if (random_hex(hex, 8) != 0) {
+            fprintf(stderr, "bjmsg: cannot read /dev/urandom\n");
+            return 1;
+        }
+        snprintf(generated, sizeof generated, "sub-%s", hex);
+        consumer = generated;
+    }
+
+    /* A token by default, so a stray POST at this port is refused rather
+     * than printed as if the broker had sent it. */
+    char auto_token[65];
+    if (!token) {
+        if (random_hex(auto_token, 16) != 0) {
+            fprintf(stderr, "bjmsg: cannot read /dev/urandom\n");
+            return 1;
+        }
+        token = auto_token;
+    }
 
     client c;
     if (client_init(&c, retry_ms) != 0) return 1;
-    curl_easy_setopt(c.curl, CURLOPT_HTTPGET, 1L);
 
-    sub_target *targets = NULL;
-    int ntargets = 0, cap = 0;
-    if (!is_pattern) {
-        targets = calloc(1, sizeof *targets);
-        if (!targets) { client_free(&c); return 1; }
-        snprintf(targets[0].subject, sizeof targets[0].subject, "%s", subject);
-        targets[0].from = start_from;
-        targets[0].tail = tail;
-        ntargets = cap = 1;
+    /* Find out where we are before deciding where to listen. */
+    char local_ip[64] = "127.0.0.1";
+    if (!bind_addr || !callback) {
+        if (probe_local_ip(&c, url_base, local_ip, sizeof local_ip) != 0) {
+            if (g_stop) { client_free(&c); return 0; }
+            fprintf(stderr, "bjmsg: cannot reach the broker at %s\n", url_base);
+            client_free(&c);
+            return 1;
+        }
+    }
+    if (!bind_addr) bind_addr = local_ip;
+
+    receiver r;
+    memset(&r, 0, sizeof r);
+    snprintf(r.path, sizeof r.path, "/deliver");
+    snprintf(r.token, sizeof r.token, "%s", token);
+    r.exec = exec_cmd;
+    r.show_subject = is_pattern;
+
+    http11c_server *srv = http11c_server_new();
+    if (!srv) { client_free(&c); return 1; }
+    http11c_set_ctx(srv, &r);
+    http11c_set_max_body(srv, 8u * 1024 * 1024);
+    /*
+     * The broker holds one connection here and uses it whenever there is
+     * something to send, which on a quiet subject may be a long time. An
+     * idle timeout shorter than that would close a connection that is
+     * working exactly as intended.
+     */
+    http11c_set_idle_timeout(srv, RECEIVER_IDLE_TIMEOUT_SECS);
+    http11c_route(srv, "POST", r.path, h_deliver);
+
+    if (http11c_listen(srv, bind_addr, port) != 0) {
+        fprintf(stderr, "bjmsg: cannot listen on %s:%d\n", bind_addr, port);
+        http11c_server_free(srv);
+        client_free(&c);
+        return 1;
+    }
+    port = http11c_port(srv);
+
+    char self[BJM_CALLBACK_MAX + 1];
+    if (callback) {
+        snprintf(self, sizeof self, "%s", callback);
+    } else {
+        char host[80];
+        host_for_url(local_ip, host, sizeof host);
+        snprintf(self, sizeof self, "http://%s:%d%s", host, port, r.path);
     }
 
+    long status = push_register(&c, url_base, subject, consumer, self,
+                                token, batch, tail, from);
+    if (status != 200) {
+        if (status > 0) report_error(&c, status);
+        http11c_server_free(srv);
+        client_free(&c);
+        return g_stop ? 0 : 1;
+    }
+
+    fprintf(stderr, "bjmsg: receiving %s as '%s' on %s\n",
+            subject, consumer, self);
+
     int rc = 0;
-    int first_resolve = 1;
-    long since_resolve = RESOLVE_EVERY_MS;   /* resolve on the first pass */
+    long since_beat = 0;
     while (!g_stop) {
-        if (is_pattern && since_resolve >= RESOLVE_EVERY_MS) {
-            since_resolve = 0;
-            /*
-             * Only the first resolve honours --tail. A subject that
-             * appears later did not exist when the subscription started,
-             * so it has no backlog to skip — everything in it is new,
-             * and starting at its end would silently drop whatever was
-             * published between its creation and this resolve.
-             */
-            if (resolve_pattern(&c, url_base, subject, &targets,
-                                &ntargets, &cap,
-                                first_resolve ? start_from : 1,
-                                first_resolve ? tail : 0) != 0) {
-                rc = 1;
-                break;
-            }
-            /* Nothing matched yet, so nothing has been skipped: the
-             * next resolve is still the subscription starting. */
-            if (ntargets > 0) first_resolve = 0;
-            if (ntargets == 0) {
-                if (!follow) break;
-                sleep_ms(interval);
-                since_resolve += interval;
-                continue;
-            }
-        }
+        if (http11c_poll(srv, 1000) < 0) { rc = 1; break; }
+        if (heartbeat_ms <= 0) continue;
 
-        int delivered = 0, absent = 0, fatal = 0;
-        for (int i = 0; i < ntargets && !g_stop; i++) {
-            int n = poll_target(&c, url_base, &targets[i], consumer,
-                                max_bytes, is_pattern);
-            if (n == POLL_FATAL) { fatal = 1; break; }
-            if (n == POLL_ABSENT) { absent++; continue; }
-            delivered += n;
-        }
-        if (fatal) { rc = g_stop ? rc : 1; break; }
+        since_beat += 1000;
+        if (since_beat < heartbeat_ms) continue;
+        since_beat = 0;
 
-        /* A named subject that does not exist is an error unless we are
-         * waiting for it; under a pattern it just means "not yet". */
-        if (!is_pattern && absent == ntargets && !follow && !tail) {
-            report_error(&c, 404);
-            rc = 1;
-            break;
-        }
-
-        if (delivered == 0) {
-            if (!follow) break;          /* caught up everywhere */
-            sleep_ms(interval);
-            since_resolve += interval;
-        }
+        /*
+         * Re-assert the subscription. It normally changes nothing, and
+         * that is the point: the one case it matters is a broker that no
+         * longer has us, which silence is indistinguishable from.
+         */
+        c.waiting = 0;
+        if (push_register(&c, url_base, subject, consumer, self,
+                          token, batch, tail, from) != 200 && !g_stop)
+            fprintf(stderr, "bjmsg: could not re-register the subscription\n");
     }
 
     /*
-     * The receipt for each subject's last batch has nowhere to piggyback
-     * once the loop ends, so send it explicitly — unless a later poll
-     * already carried it, which X-Bjmsg-Acked tells us for free. One
-     * attempt each regardless of --retry: hanging on the way out is
-     * worse than a redelivery that at-least-once already permits.
+     * Stop the deliveries before this process is not there to take them.
+     * One attempt, retries off: hanging on the way out is worse than a
+     * subscription the broker retires when its callback stops answering.
+     * The receipt survives either way — unregistering says "not here",
+     * not "forget where I was".
      */
-    if (consumer && rc == 0) {
+    if (!keep) {
         g_stop = 0;
         c.retry_ms = 0;
-        for (int i = 0; i < ntargets; i++) {
-            sub_target *t = &targets[i];
-            if (t->pending_ack <= t->acked) continue;
-            char url[1024];
-            snprintf(url, sizeof url, "%s/ack/%s?consumer=%s&index=%llu",
-                     url_base, t->subject, consumer,
-                     (unsigned long long)t->pending_ack);
-            curl_easy_setopt(c.curl, CURLOPT_POST, 1L);
-            curl_easy_setopt(c.curl, CURLOPT_POSTFIELDS, "");
-            curl_easy_setopt(c.curl, CURLOPT_POSTFIELDSIZE, 0L);
-            c.waiting = 0;
-            if (client_perform(&c, url) != 200)
-                fprintf(stderr, "bjmsg: final ack of %s index %llu failed"
-                                " (that batch will be redelivered)\n",
-                        t->subject, (unsigned long long)t->pending_ack);
-        }
+        c.waiting = 0;
+        if (push_unregister(&c, url_base, consumer, ephemeral) != 200)
+            fprintf(stderr, "bjmsg: could not unregister '%s'; the broker "
+                            "will keep trying to deliver to %s until it is "
+                            "removed (bjmsg unsubscribe)\n", consumer, self);
     }
 
-    free(targets);
+    http11c_server_free(srv);
     client_free(&c);
     return rc;
 }
@@ -1040,6 +1243,35 @@ int bjm_cmd_consumers(int argc, char **argv) {
 
     char url[1024];
     snprintf(url, sizeof url, "%s/consumers/%s", o.url_base, o.subject);
+    return query_run(&o, NULL, url);
+}
+
+#define PUSH_USAGE \
+    "usage: bjmsg push [--url URL] [--consumer NAME --delete]\n" \
+    "\n" \
+    "Without arguments, list the broker's push subscriptions and how each\n" \
+    "is faring: how many messages it has taken, whether a delivery is in\n" \
+    "flight, and the last error if its callback is not answering.\n" \
+    "\n" \
+    "--consumer NAME --delete unregisters one, which is how you retire a\n" \
+    "subscriber that went away without saying so. Its read receipt is\n" \
+    "kept; bjmsg unsubscribe discards that too.\n"
+
+int bjm_cmd_push(int argc, char **argv) {
+    query_opts o;
+    int rc = query_parse(argc, argv, &o, PUSH_USAGE);
+    if (rc) return rc == 1 ? 0 : rc;
+
+    char url[1024];
+    if (o.del) {
+        if (!o.consumer || !bjm_consumer_valid(o.consumer)) {
+            fputs(PUSH_USAGE, stderr);
+            return 2;
+        }
+        snprintf(url, sizeof url, "%s/push?consumer=%s", o.url_base, o.consumer);
+        return query_run(&o, "DELETE", url);
+    }
+    snprintf(url, sizeof url, "%s/push", o.url_base);
     return query_run(&o, NULL, url);
 }
 

@@ -6,9 +6,13 @@ payloads, as one executable that is either the broker or a client.
 ```sh
 make
 ./bin/bjmsg serve &
+./bin/bjmsg sub orders.new &
 ./bin/bjmsg pub orders.new "first message"
-./bin/bjmsg sub orders.new --follow
 ```
+
+Nothing polls. `sub` starts a small HTTP server of its own and tells the
+broker to POST matching messages to it, so a publish reaches a subscriber
+in well under a millisecond and an idle broker costs nothing.
 
 For a broker, three subscribers and a publisher across five terminals —
 the [NATS hello-nats tutorial](https://docs.nats.io/tutorials/hello-nats)
@@ -61,6 +65,10 @@ bare `curl` against a broken request is readable.
 | route | body / query | response |
 | --- | --- | --- |
 | `POST /pub/<subject>` | one binjson value, `?id=&ack_subject=&ack_consumer=&ack_index=` | `{ subject, index, acked, duplicate }` |
+| `PUT /push/<subject\|pattern>` | `?consumer=&callback=[&token=&batch=&start=last\|&from=]` | `{ consumer, pattern, callback, created }` |
+| `DELETE /push` | `?consumer=[&purge=1]` | `{ consumer, deleted, purged }` |
+| `GET /push` | | ARRAY of `{ consumer, pattern, callback, delivered, inflight, failures, error }` |
+| `POST <callback>` | ARRAY of `{ index, term, type, payload }`, plus `X-Bjmsg-*` | `2xx` acks; `X-Bjmsg-Ack: N` acks part |
 | `GET /sub/<subject>` | `?from=&max=` | ARRAY of `{ index, term, type, payload }` |
 | `GET /sub/<subject>` | `?consumer=&ack=&start=` | same, from the consumer's receipt |
 | `POST /ack/<subject>` | `?consumer=&index=` | `{ subject, consumer, acked }` |
@@ -95,24 +103,133 @@ before it is accepted. The log would happily store anything, and the
 malformed message would only surface as an undecodable payload in a
 subscriber, after it was durable.
 
-## Subscribers poll
+## Messages are pushed
 
-http11c serializes a response the moment the handler returns — there is no
-chunked encoding, no SSE, and no way to hold a response open. So delivery
-is pull-based: the subscriber sends its cursor as `from` and gets back
-whatever exists.
+A subscription is a **callback**: a URL the broker can reach. The broker
+POSTs each batch to it, and **the HTTP response is the acknowledgement**.
 
-The cursor living in the request is what makes the broker stateless per
-subscriber. There is no session table, nothing to reap, and a subscriber
-that crashes resumes from exactly where it left off. `sub --follow` polls
-on one kept-alive connection, so a poll is a small request on an
-already-open socket.
+```sh
+bjmsg sub orders.new                     # starts a receiver, registers it
+bjmsg sub orders.new --consumer billing  # ...durable
+bjmsg push                               # what the broker is delivering to
+```
 
-Because every message is durable, a new subscriber replays the subject
-from the beginning by default. `sub --tail` asks for a cursor past the end
-of the log — the broker answers with an empty batch and the real last
-index — which skips the backlog and gives NATS-core-like "only what is
-published from now on" behaviour.
+That one decision buys three things that a streaming design would have to
+work for:
+
+- **Nothing in http11c had to change.** It cannot hold a response open —
+  no chunked encoding, no SSE — which is what forced polling before. But
+  a webhook needs none of that: the broker is an ordinary HTTP client and
+  the subscriber an ordinary HTTP server, both of which already existed
+  in this binary.
+- **The ack needs no channel of its own.** Delivery and acknowledgement
+  are one exchange on one kept-alive connection. `2xx` accepts the batch;
+  `X-Bjmsg-Ack: N` accepts it as far as N and leaves the rest to be sent
+  again.
+- **Backpressure needs no policy.** The broker holds **at most one
+  delivery in flight per subscription**, so a subscriber that is busy
+  simply does not answer yet. Nothing queues up in the broker, nothing has
+  to be bounded, and no slow consumer ever gets disconnected — it just
+  lags, and the log is where the backlog was going to live anyway.
+
+Each delivery carries what a subscriber needs without decoding anything:
+
+| header | |
+| --- | --- |
+| `X-Bjmsg-Subject` | which subject this batch is from |
+| `X-Bjmsg-Consumer` | which subscription it is for |
+| `X-Bjmsg-First-Index` / `X-Bjmsg-Last-Index` | the range in the batch |
+| `X-Bjmsg-Count` | how many messages |
+| `X-Bjmsg-Lag` | how many are still waiting behind it |
+| `Authorization: Bearer …` | the token the subscription registered with |
+
+The body is byte-for-byte what `GET /sub` returns, so both paths decode
+the same way.
+
+### The costs, honestly
+
+**The subscriber must be reachable.** The connection direction is
+reversed: the broker dials out. That is right for a topology of instances
+— and it is what makes a broker subscribing to another broker just an
+ordinary subscription whose callback happens to be a broker — but a client
+the broker cannot reach cannot be pushed to. `bjmsg sub` works around the
+common case by binding to the local address it reaches the broker from
+(libcurl's `CURLINFO_LOCAL_IP`, learned from the registration it had to
+make anyway), so nothing needs configuring on one machine or one network.
+`--callback` covers a port forward or a proxy.
+
+**The broker ticks while delivering.** Outbound transfers run on libcurl's
+multi interface, interleaved with `http11c_poll` from `bjm_serve`'s loop.
+http11c does not expose its readiness fd, so with a delivery in flight the
+loop asks for a 2 ms poll timeout instead of blocking — a local syscall,
+not a request on a wire, and only while something is actually being
+delivered. Idle, it blocks for a full second and burns nothing measurable.
+Exposing that fd upstream would remove even the tick.
+
+### Where a subscription starts, and where it keeps its place
+
+A push subscription **holds no cursor of its own**. How far it has read is
+its ordinary read receipt, which is why it shows in `bjmsg consumers`,
+survives a broker restart, and counts against retention exactly like a
+pull subscription would.
+
+Where it *starts* is settled once, when it is registered — `?start=last`
+skips whatever exists, `?from=N` picks an index, and the default replays
+the log. Doing it at registration rather than at delivery is what makes
+wildcards behave: a subject created *later* has no receipt, so it is
+delivered from its first message. Deciding at delivery time would silently
+drop whatever was published between that subject appearing and the broker
+noticing it.
+
+### Failure
+
+A callback that does not answer is retried, doubling from 500 ms to a
+30 s ceiling, **forever**. Giving up would mean deciding on the
+subscriber's behalf that its messages no longer matter, and there is no
+need to decide: the receipt is durable, so an unreachable subscription is
+merely behind. `bjmsg push` shows the failure count and the last error.
+
+A `2xx` with `X-Bjmsg-Ack: 0` is a soft refusal — "not now" — and takes
+the same backoff, so a subscriber whose handler is failing does not spin.
+`bjmsg sub --exec CMD` uses exactly that: a non-zero exit refuses that
+message and everything after it in the batch, which are then redelivered
+in order.
+
+### Registration, and the one thing that is not push
+
+`bjmsg sub` re-asserts its subscription every 30 s (`--heartbeat MS`,
+`0` to disable). This is liveness, not polling: it carries no cursor and
+asks for no messages. What it buys is self-healing — a broker whose store
+was rebuilt has no record of the subscription, and silence is
+indistinguishable from "nothing to send". Re-registering is a `PUT`, which
+moves the callback and leaves the receipt alone, so it is also how a
+subscriber that restarted on a different port says where it moved to.
+
+On exit, `sub` unregisters. A named subscription keeps its receipt, so it
+resumes; a throwaway one purges it, because a receipt holds retention off
+everything below it and an abandoned one would pin the log for good.
+`--keep` leaves the subscription registered so the broker keeps queueing.
+
+### Security
+
+The broker connects to a URL a client supplied, which deserves stating
+plainly. Callbacks must be `http://` or `https://` and printable and
+space-free (so nothing can smuggle a header into the delivery), and
+redirects are not followed. That is syntax, not authorisation: **a broker
+open to untrusted clients can be pointed at things on its own network**,
+and should be behind something that decides which callbacks are allowed.
+
+In the other direction, each subscription registers a bearer token that
+the broker sends on every delivery — `bjmsg sub` generates a random one
+unless given `--token` — so a subscriber refuses a POST that did not come
+from the broker it registered with. This is the subscriber authenticating
+the broker; consumer names are still asserted rather than authenticated,
+so anything that can reach the broker can claim one.
+
+### `GET /sub` is still there
+
+Pull still exists, as the way to *read* a subject rather than subscribe to
+one: browsing, one-shot tooling, `bjmsg dead`. Nothing subscribes with it.
 
 ## Reconnecting
 
@@ -121,13 +238,15 @@ Every client waits and retries when the broker cannot be reached, every
 and fails on the first refusal.
 
 ```sh
-bjmsg sub greet --follow                 # survives the broker restarting
-bjmsg sub greet --follow --retry 500     # ...more eagerly
+bjmsg sub greet                          # survives the broker restarting
+bjmsg sub greet --retry 500              # ...more eagerly
 bjmsg pub greet "hi" --retry 0           # fail now rather than wait
 ```
 
 So a subscriber can be started before the broker exists, and keeps its
-place across a broker restart.
+place across a broker restart. A subscription that is already registered
+needs no reconnecting at all — the broker restarts, reads it back out of
+`_push.bpt`, and carries on delivering.
 
 Only connection failures are retried — an HTTP status is the broker
 answering, and a 404 or 415 is not going to become a 200. Which failures
@@ -314,20 +433,18 @@ bjmsg subjects 'orders.>'
 ```
 
 Output gains a subject column, because **each matched subject keeps its
-own cursor**. That is the whole of the design: subjects have independent
+own receipt**. That is the whole of the design: subjects have independent
 index spaces, so a wildcard subscription is N ordinary subscriptions
 discovered by pattern instead of by name. Durable ones need no new
 storage at all — receipts are already keyed `<subject>/<consumer>`, so
 `sub 'orders.*' --consumer w` is simply a receipt per match, and
 `bjmsg consumers orders.us` lists it like any other.
 
-Matching happens during **subject discovery**, not during the read: the
-client asks `GET /subjects?pattern=` and then polls each match with the
-machinery a single-subject subscription already uses. That costs one
-request per matched subject per poll instead of one overall — fine for
-tens of subjects on a kept-alive connection. If that ever bites, the fix
-is a merged server-side read, which would have to give up the
-verbatim-forwarding that makes single-subject `sub` free.
+Matching happens **in the broker**, which is where the subjects are. A
+pushed wildcard subscription is one registration, and the broker walks its
+matches round-robin — so no subject starves behind a busy one, and a
+client learns about a new subject by being sent a message from it rather
+than by asking whether one appeared.
 
 Two things worth knowing:
 
@@ -335,10 +452,11 @@ Two things worth knowing:
   order and the interleaving means nothing — `orders.us` index 5 and
   `orders.eu` index 5 are unrelated messages. If you need a total order
   over a set, they have to be one subject.
-- **New subjects are picked up** as they are created, re-resolved every
-  few seconds. `--tail` applies only to what existed when the
-  subscription started; a subject created later is delivered from its
-  first message, since nothing in it predates the subscription.
+- **New subjects are picked up the moment they exist**, with nothing
+  re-resolving: every append tells the broker, and a subject with no
+  receipt for this consumer starts at its first message. `--tail` applies
+  only to what existed when the subscription was registered, since
+  nothing in a later subject predates it.
 
 ## Read receipts: durable subscriptions
 
@@ -347,7 +465,7 @@ a **read receipt** — the highest index that consumer has acknowledged —
 so rejoining delivers exactly what was missed and nothing else:
 
 ```sh
-bjmsg sub work --consumer w1 --follow    # ...run it, stop it, run it again
+bjmsg sub work --consumer w1             # ...run it, stop it, run it again
 bjmsg consumers work
 [{"consumer":"w1","acked":8,"lag":0}]
 ```
@@ -358,14 +476,10 @@ back unambiguously and one subject's consumers are a contiguous range —
 which is what `GET /consumers/<subject>` scans. A receipt only ever moves
 forward, so a late or duplicated ack cannot rewind a consumer into replay.
 
-The ack **piggybacks on the next poll** (`?ack=N`), so a steady-state
-subscriber still makes one request per cycle: the broker records the
-receipt, then picks the next batch from it. The receipt for the final
-batch has nowhere to ride, so `bjmsg sub` catches SIGINT and sends one
-explicit `POST /ack` on the way out — skipping it when `X-Bjmsg-Acked`
-shows a later poll already carried it. That shutdown ack gets a single
-attempt regardless of `--retry`, because hanging on the way out is worse
-than a redelivery that at-least-once already permits.
+For a pushed subscription the ack costs no request at all: it **is** the
+response to the delivery, and the broker fsyncs the receipt before
+choosing the next batch. `POST /ack/<subject>?consumer=&index=` remains
+for moving a receipt by hand (`bjmsg seek`).
 
 Delivery is **at-least-once**. An ack commits with a CRC, so it survives
 the broker process dying, but it is not fsynced — that second fsync per
@@ -607,14 +721,20 @@ What a reader sees after a trim depends on which kind of cursor it holds:
   sync has to happen before the `200` goes out, and http11c sends the
   response as soon as the handler returns. Batching needs deferred
   responses first.
-- **Polling latency.** Mean latency is half the poll interval. The fix is
-  the same one: a `http11c_res_defer` / `http11c_respond` pair would turn
-  the poll into a real long-poll with sub-millisecond delivery and no idle
-  traffic. It is outside http11c's stated scope, so it is a deliberate
-  fork-or-upstream decision, not an oversight.
-- **Single subject per subscribe.** No wildcards or multi-subject
-  subscriptions yet; the design for those is a subject registry (a B+
-  tree, prefix-scanned) plus one cursor per matched subject.
+- **A pushed subscriber must be reachable by the broker.** That is the
+  webhook trade, and it is the right one for a topology of instances, but
+  a client behind a NAT the broker cannot traverse has no push path.
+  `--callback` covers a port forward; anything else would need the
+  streamed/long-poll design that this deliberately avoided.
+- **The broker polls its own event loop while delivering** — a 2 ms
+  timeout on `http11c_poll` instead of blocking, because http11c does not
+  expose its readiness fd for libcurl's sockets to be waited on alongside.
+  It costs nothing when idle and nothing measurable in flight, but a
+  `http11c_pollfd()` upstream would remove it.
+- **Queue-group workers still poll.** `bjmsg work`, `bjmsg reply` and
+  `bjmsg pipe` drive `POST /take` on an interval. The delivery engine
+  generalises to them — a leased job POSTed to a callback, `2xx` meaning
+  done and anything else meaning fail — and that is the next piece.
 - **A queue group's in-flight table is capped** at 256 jobs. Past that a
   `take` returns nothing until acks come in, which is backpressure rather
   than an error — but it does bound how many jobs one group can have
@@ -623,7 +743,10 @@ What a reader sees after a trim depends on which kind of cursor it holds:
   subject, so give it a retention policy —
   `bjmsg policy jobs.dead --max-age 30d` — or it grows without limit.
 - **Consumer names are asserted, not authenticated.** Any client claiming
-  a name advances that subscription's receipt.
+  a name advances that subscription's receipt, and can repoint its
+  callback. A broker reachable by untrusted clients also needs its
+  outbound callbacks restricted; validating the URL's syntax is not the
+  same as deciding where the broker may connect.
 - **The retention sweep is O(subjects with policies).** Fine for tens or
   hundreds; a store with very many policied subjects would want the sweep
   to prioritise rather than walk them all every 10 s.

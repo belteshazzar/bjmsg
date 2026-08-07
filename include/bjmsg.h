@@ -154,6 +154,15 @@ int bjm_cursor_delete(bjm_store *st, const char *subject,
                       const char *consumer, int *deleted);
 
 /*
+ * Forget every receipt this consumer holds, on any subject, reporting how
+ * many through *deleted. A receipt holds back retention, so a throwaway
+ * subscription that merely stopped delivering would otherwise pin the log
+ * it was reading for good.
+ */
+int bjm_cursor_delete_consumer(bjm_store *st, const char *consumer,
+                               int *deleted);
+
+/*
  * How many consumers `subject` has and the lowest index any of them has
  * acknowledged — the boundary below which trimming discards messages
  * somebody is still entitled to. *min_acked is UINT64_MAX when there are
@@ -164,6 +173,102 @@ int bjm_consumer_stats(bjm_store *st, const char *subject,
 
 /* Highest index currently in `subject`, or 0 if it does not exist. */
 uint64_t bjm_last_index(bjm_store *st, const char *subject);
+
+/* ---- push subscriptions ------------------------------------------------ */
+
+/*
+ * Messages are pushed, never polled. A subscriber registers a callback —
+ * a URL the broker can reach — and the broker POSTs each batch to it; the
+ * HTTP response *is* the acknowledgement, so delivery and ack are one
+ * round trip on one kept-alive connection, and a subscriber that is busy
+ * simply does not answer yet, which is all the backpressure there is to
+ * apply.
+ *
+ * The subscription holds no cursor. How far the consumer has read is its
+ * ordinary receipt in the cursor tree, which is why a push subscription
+ * shows up in `bjmsg consumers`, survives the broker restarting, and
+ * counts against retention exactly like any other subscription.
+ */
+#define BJM_CALLBACK_MAX 512
+#define BJM_TOKEN_MAX    128
+
+typedef struct {
+    char     pattern[BJM_SUBJECT_MAX + 1];  /* subject or wildcard pattern */
+    char     callback[BJM_CALLBACK_MAX + 1];
+    char     token[BJM_TOKEN_MAX + 1];      /* "" for none; sent as Bearer */
+    uint64_t batch_bytes;                   /* 0 = the broker's default    */
+} bjm_push_sub;
+
+int bjm_callback_valid(const char *url);
+int bjm_token_valid(const char *s);
+
+int bjm_push_get(bjm_store *st, const char *consumer, int *found,
+                 bjm_push_sub *out);
+int bjm_push_set(bjm_store *st, const char *consumer, const bjm_push_sub *s);
+int bjm_push_delete(bjm_store *st, const char *consumer, int *deleted);
+
+/*
+ * Visit every registered subscription; `fn` returning non-zero stops the
+ * walk. It must not call back into the push registry, whose reads share
+ * one output buffer with this scan.
+ */
+int bjm_push_each(bjm_store *st,
+                  int (*fn)(void *ctx, const char *consumer,
+                            const bjm_push_sub *s),
+                  void *ctx);
+
+/*
+ * Called after every append is durable, whichever route made it. The
+ * delivery engine listens here rather than on the publish handler, so a
+ * message that arrives by requeue or by dead-lettering wakes subscribers
+ * the same way an ordinary publish does.
+ */
+void bjm_store_on_publish(bjm_store *st,
+                          void (*cb)(void *ctx, const char *subject,
+                                     uint64_t index),
+                          void *ctx);
+
+/* ---- the delivery engine ----------------------------------------------- */
+
+/*
+ * The broker's outbound half: one libcurl multi handle driving at most
+ * one delivery per subscription, pumped from the same loop that serves
+ * requests. Nothing here blocks.
+ */
+typedef struct bjm_pusher bjm_pusher;
+
+bjm_pusher *bjm_pusher_new(bjm_store *st, uint64_t default_batch_bytes);
+void        bjm_pusher_free(bjm_pusher *p);
+int         bjm_pusher_count(const bjm_pusher *p);
+
+int  bjm_pusher_add(bjm_pusher *p, const char *consumer,
+                    const bjm_push_sub *cfg);
+void bjm_pusher_remove(bjm_pusher *p, const char *consumer);
+
+/*
+ * Write the receipts a brand-new subscription implies, so that where it
+ * starts is decided once instead of on every delivery: `at_end` skips
+ * whatever already exists, `from` starts at a chosen index, and the
+ * default replays everything still in the log. Subjects that already have
+ * a receipt for this consumer keep it.
+ */
+int bjm_pusher_seed(bjm_pusher *p, const char *consumer, const char *pattern,
+                    int at_end, uint64_t from);
+
+/* A message landed on `subject`: wake anything subscribed to it. */
+void bjm_pusher_notify(bjm_pusher *p, const char *subject);
+
+/*
+ * Start whatever deliveries are due and service the ones in flight.
+ * Returns how many milliseconds the caller may block before pumping
+ * again — pass it to http11c_poll.
+ */
+int bjm_pusher_pump(bjm_pusher *p, uint64_t now_ms);
+
+/* Live state of every subscription, as a binjson ARRAY of objects. */
+int bjm_pusher_list(bjm_pusher *p, const uint8_t **out, size_t *out_len);
+
+uint64_t bjm_now_ms(void);
 
 /* ---- producer idempotency ---------------------------------------------- */
 
@@ -379,6 +484,7 @@ int bjm_cmd_sub(int argc, char **argv);
  * Query commands: connect to a broker, ask one question, print the
  * answer, exit. They neither publish, subscribe, nor serve.
  */
+int bjm_cmd_push(int argc, char **argv);
 int bjm_cmd_consumers(int argc, char **argv);
 int bjm_cmd_unsubscribe(int argc, char **argv);
 int bjm_cmd_subjects(int argc, char **argv);

@@ -40,6 +40,7 @@
 #define QUEUES_FILE  "_queues.bpt"
 #define DEDUP_FILE_0 "_dedup0.bpt"
 #define DEDUP_FILE_1 "_dedup1.bpt"
+#define PUSH_FILE    "_push.bpt"
 #define CURSORS_ORDER 64
 
 /*
@@ -90,6 +91,16 @@ struct bjm_store {
     int         dd_open;
     uint64_t    dd_rotated_ms;
     uint64_t    dd_window_ms;
+    bj_io       push_io;
+    bpt        *push;     /* opened on first use */
+    /*
+     * Told about every append, whoever made it — a publish, a requeue, a
+     * job going to its dead-letter channel. The delivery engine hangs off
+     * this rather than off the publish route, because a message that
+     * appears by some other path is still a message somebody subscribed to.
+     */
+    void      (*on_pub)(void *ctx, const char *subject, uint64_t index);
+    void       *on_pub_ctx;
 };
 
 /* ---- names ----------------------------------------------------------- */
@@ -225,6 +236,11 @@ void bjm_store_free(bjm_store *st) {
         bpt_free(st->dd[i]);
         st->ns.close(st->ns.ctx, &st->dd_io[i]);
     }
+    if (st->push) {
+        bpt_sync(st->push);
+        bpt_free(st->push);
+        st->ns.close(st->ns.ctx, &st->push_io);
+    }
     free(st->qscratch);
     bj_builder_free(st->bld);
     bj_builder_free(st->cbld);
@@ -299,7 +315,23 @@ int bjm_publish(bjm_store *st, const char *subject_name, int entry_type,
     /* Only does anything for a subject with an age policy, and then only
      * once per mark interval. */
     mark_publish(st, s, *out_index);
+
+    /*
+     * After the sync, so a subscriber can never be handed a message that
+     * is not yet durable. `s` may be dangling by the time this returns —
+     * the callback can publish, and publishing can realloc st->subs — so
+     * nothing below may touch it.
+     */
+    if (st->on_pub) st->on_pub(st->on_pub_ctx, subject_name, *out_index);
     return BJ_OK;
+}
+
+void bjm_store_on_publish(bjm_store *st,
+                          void (*cb)(void *ctx, const char *subject,
+                                     uint64_t index),
+                          void *ctx) {
+    st->on_pub = cb;
+    st->on_pub_ctx = ctx;
 }
 
 int bjm_read(bjm_store *st, const char *subject_name, uint64_t from,
@@ -456,6 +488,66 @@ int bjm_cursor_delete(bjm_store *st, const char *subject, const char *consumer,
     return bpt_sync(st->cursors);
 }
 
+/*
+ * Forget every receipt a consumer holds, whatever subject it is on.
+ *
+ * Keys are "<subject>/<consumer>", so one consumer's receipts are spread
+ * across the tree rather than contiguous and this is a full scan. That is
+ * the right trade: subject-first ordering is what makes the common
+ * queries ("who reads this subject", "how far behind is the slowest")
+ * one range each, and this runs once, when a throwaway subscription
+ * leaves.
+ */
+int bjm_cursor_delete_consumer(bjm_store *st, const char *consumer,
+                               int *deleted) {
+    *deleted = 0;
+    int e = cursors_open(st);
+    if (e) return e;
+
+    size_t clen = strlen(consumer);
+
+    /* Collected first, deleted after: the cursor's key bytes live in the
+     * tree's buffer, which a delete is entitled to reuse. */
+    char (*keys)[BJM_SUBJECT_MAX + BJM_CONSUMER_MAX + 2] = NULL;
+    size_t n = 0, cap = 0;
+
+    bpt_cursor *c = bpt_cursor_open(st->cursors, NULL, NULL);
+    if (!c) return BJ_ERR_STATE;
+
+    bpt_key k;
+    const uint8_t *val;
+    size_t val_len;
+    int rc;
+    while ((rc = bpt_cursor_next(c, &k, &val, &val_len)) == 1) {
+        if (!k.is_string || k.str_len <= clen + 1) continue;
+        const uint8_t *tail = k.str + k.str_len - clen;
+        if (tail[-1] != '/' || memcmp(tail, consumer, clen) != 0) continue;
+
+        if (n == cap) {
+            size_t ncap = cap ? cap * 2 : 8;
+            void *p = realloc(keys, ncap * sizeof *keys);
+            if (!p) { rc = BJ_ERR_OOM; break; }
+            keys = p;
+            cap = ncap;
+        }
+        memcpy(keys[n], k.str, k.str_len);
+        keys[n][k.str_len] = '\0';
+        n++;
+    }
+    bpt_cursor_close(c);
+
+    if (rc >= 0) {
+        for (size_t i = 0; i < n; i++) {
+            bpt_key key = { 1, 0, (const uint8_t *)keys[i],
+                            (uint32_t)strlen(keys[i]) };
+            if (bpt_delete(st->cursors, &key) == BJ_OK) (*deleted)++;
+        }
+        if (*deleted) rc = bpt_sync(st->cursors);
+    }
+    free(keys);
+    return rc < 0 ? rc : BJ_OK;
+}
+
 /* Bounds of one subject's consumer keys: "<subject>/" .. "<subject>0",
  * '0' being the byte after '/'. */
 static void consumer_range(const char *subject, char *lo, size_t lo_cap,
@@ -550,6 +642,215 @@ int bjm_consumers(bjm_store *st, const char *subject,
     if (e) return e;
     *out = bj_builder_data(b, out_len);
     return *out ? BJ_OK : BJ_ERR_STATE;
+}
+
+/* ---- push subscriptions ------------------------------------------------ */
+
+/*
+ * A push subscription is a consumer plus somewhere to send its messages.
+ * It lives in its own tree keyed by the consumer name, and it deliberately
+ * carries no cursor of its own: how far the consumer has read is the
+ * receipt in _cursors.bpt, exactly as for a pull subscriber. So the same
+ * subscription can be pushed today and pulled tomorrow without losing its
+ * place, `bjmsg consumers` reports both, and retention's trim boundary
+ * already accounts for it.
+ */
+static int push_open(bjm_store *st) {
+    if (st->push) return BJ_OK;
+
+    bj_io io;
+    int e = st->ns.open(st->ns.ctx, PUSH_FILE, sizeof PUSH_FILE - 1,
+                        BJ_NS_CREATE, &io);
+    if (e) return e;
+
+    int fresh = io.size(io.ctx) == 0;
+    bpt *t = fresh ? bpt_create(&io, CURSORS_ORDER) : bpt_open(&io);
+    if (!t) { st->ns.close(st->ns.ctx, &io); return BJ_ERR_STATE; }
+    if (fresh) st->ns.sync(st->ns.ctx);
+
+    st->push_io = io;
+    st->push = t;
+    return BJ_OK;
+}
+
+/*
+ * A callback the broker will connect to, so this is the one place a client
+ * gets to point the broker at an address of its choosing. Keep it narrow:
+ * an http(s) URL of printable, space-free ASCII. Space and the control
+ * bytes are what would otherwise let a crafted callback smuggle a second
+ * request line or a header into the delivery.
+ *
+ * That is a syntactic check, not an authorisation one — see README on
+ * running a broker where the callbacks are not all trusted.
+ */
+int bjm_callback_valid(const char *url) {
+    if (!url) return 0;
+    size_t n = strlen(url);
+    if (n == 0 || n > BJM_CALLBACK_MAX) return 0;
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0)
+        return 0;
+    for (size_t i = 0; i < n; i++)
+        if (url[i] <= 0x20 || (unsigned char)url[i] >= 0x7f) return 0;
+    return 1;
+}
+
+int bjm_token_valid(const char *s) {
+    size_t n = s ? strlen(s) : 0;
+    if (n > BJM_TOKEN_MAX) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (s[i] <= 0x20 || (unsigned char)s[i] >= 0x7f) return 0;
+    return 1;
+}
+
+static void push_key(const char *consumer, bpt_key *key) {
+    key->is_string = 1;
+    key->num = 0;
+    key->str = (const uint8_t *)consumer;
+    key->str_len = (uint32_t)strlen(consumer);
+}
+
+/* Decoding one record: a flat object of strings and one int. */
+typedef struct {
+    char key[32];
+    bjm_push_sub *s;
+} push_grab;
+
+static void pu_key(void *ctx, const uint8_t *k, uint32_t len) {
+    push_grab *g = ctx;
+    if (len >= sizeof g->key) len = sizeof g->key - 1;
+    memcpy(g->key, k, len);
+    g->key[len] = '\0';
+}
+
+static void pu_string(void *ctx, const uint8_t *v, uint32_t len) {
+    push_grab *g = ctx;
+    char *dst = NULL;
+    size_t cap = 0;
+    if (strcmp(g->key, "pattern") == 0)  { dst = g->s->pattern;  cap = sizeof g->s->pattern; }
+    else if (strcmp(g->key, "callback") == 0) { dst = g->s->callback; cap = sizeof g->s->callback; }
+    else if (strcmp(g->key, "token") == 0)    { dst = g->s->token;    cap = sizeof g->s->token; }
+    if (!dst) return;
+    if (len >= cap) len = (uint32_t)cap - 1;
+    memcpy(dst, v, len);
+    dst[len] = '\0';
+}
+
+static void pu_int(void *ctx, double v) {
+    push_grab *g = ctx;
+    if (strcmp(g->key, "batch_bytes") == 0) g->s->batch_bytes = (uint64_t)v;
+}
+
+int bjm_push_get(bjm_store *st, const char *consumer, int *found,
+                 bjm_push_sub *out) {
+    *found = 0;
+    memset(out, 0, sizeof *out);
+    int e = push_open(st);
+    if (e) return e;
+
+    bpt_key key;
+    push_key(consumer, &key);
+
+    const uint8_t *val = NULL;
+    size_t val_len = 0;
+    e = bpt_search(st->push, &key, found, &val, &val_len);
+    if (e || !*found) return e;
+
+    push_grab g = { {0}, out };
+    bj_visitor v = bjm_visitor_noop(&g);
+    v.on_key = pu_key;
+    v.on_string = pu_string;
+    v.on_int = pu_int;
+    return bj_decode(val, val_len, &v, NULL);
+}
+
+int bjm_push_set(bjm_store *st, const char *consumer, const bjm_push_sub *s) {
+    int e = push_open(st);
+    if (e) return e;
+
+    bj_builder *b = st->cbld;
+    bj_builder_reset(b);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"pattern", 7);
+    bj_put_string(b, (const uint8_t *)s->pattern, (uint32_t)strlen(s->pattern));
+    bj_put_key(b, (const uint8_t *)"callback", 8);
+    bj_put_string(b, (const uint8_t *)s->callback, (uint32_t)strlen(s->callback));
+    bj_put_key(b, (const uint8_t *)"token", 5);
+    bj_put_string(b, (const uint8_t *)s->token, (uint32_t)strlen(s->token));
+    bj_put_key(b, (const uint8_t *)"batch_bytes", 11);
+    bj_put_int(b, (int64_t)s->batch_bytes);
+    bj_end_object(b);
+
+    size_t len = 0;
+    const uint8_t *val = bj_builder_data(b, &len);
+    if (!val) return BJ_ERR_STATE;
+
+    bpt_key key;
+    push_key(consumer, &key);
+    e = bpt_add(st->push, &key, val, (uint32_t)len);
+    if (e) return e;
+    /*
+     * Synced on the spot. A subscription that survived the request but not
+     * a restart is the worst of both worlds: the client believes messages
+     * are being delivered somewhere, and nothing is delivering them.
+     */
+    return bpt_sync(st->push);
+}
+
+int bjm_push_delete(bjm_store *st, const char *consumer, int *deleted) {
+    *deleted = 0;
+    int e = push_open(st);
+    if (e) return e;
+
+    bpt_key key;
+    push_key(consumer, &key);
+
+    int found = 0;
+    const uint8_t *val = NULL;
+    size_t val_len = 0;
+    e = bpt_search(st->push, &key, &found, &val, &val_len);
+    if (e) return e;
+    if (!found) return BJ_OK;
+
+    e = bpt_delete(st->push, &key);
+    if (e) return e;
+    *deleted = 1;
+    return bpt_sync(st->push);
+}
+
+int bjm_push_each(bjm_store *st,
+                  int (*fn)(void *ctx, const char *consumer,
+                            const bjm_push_sub *s),
+                  void *ctx) {
+    int e = push_open(st);
+    if (e) return e;
+
+    /* Every key is a consumer name, so both bounds open is the whole set. */
+    bpt_cursor *c = bpt_cursor_open(st->push, NULL, NULL);
+    if (!c) return BJ_ERR_STATE;
+
+    bpt_key k;
+    const uint8_t *val;
+    size_t val_len;
+    int rc;
+    while ((rc = bpt_cursor_next(c, &k, &val, &val_len)) == 1) {
+        if (k.str_len > BJM_CONSUMER_MAX) continue;
+        char consumer[BJM_CONSUMER_MAX + 1];
+        memcpy(consumer, k.str, k.str_len);
+        consumer[k.str_len] = '\0';
+
+        bjm_push_sub s;
+        memset(&s, 0, sizeof s);
+        push_grab g = { {0}, &s };
+        bj_visitor v = bjm_visitor_noop(&g);
+        v.on_key = pu_key;
+        v.on_string = pu_string;
+        v.on_int = pu_int;
+        if (bj_decode(val, val_len, &v, NULL) != BJ_OK) continue;
+
+        if (fn(ctx, consumer, &s) != 0) break;
+    }
+    bpt_cursor_close(c);
+    return rc < 0 ? rc : BJ_OK;
 }
 
 /* ---- retention policy ------------------------------------------------- */

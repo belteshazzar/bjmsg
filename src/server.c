@@ -6,17 +6,22 @@
  *
  *   POST /pub/<subject>              body: one binjson value (the message)
  *                                    -> { subject, index }
+ *   PUT  /push/<pattern>?consumer=&callback=  register a push subscription
  *   GET  /sub/<subject>?from=&max=   -> ARRAY of { index, term, type, payload }
  *   GET  /subjects                   -> ARRAY of subject names
  *   GET  /health                     -> { ok, backend, subjects, conns }
  *
- * Subscribers are polled, not pushed: http11c serializes a response the
- * moment the handler returns, so there is no way to hold one open. The
- * cursor therefore lives in the request (`from`), which also means the
- * broker keeps no per-subscriber state — a subscriber that dies resumes
- * exactly where it left off, and there is no session table to reap.
+ * Subscribers are pushed to, not polled: a subscription names a callback
+ * URL, and the broker POSTs each batch to it (see push.c) with the
+ * response serving as the acknowledgement. So the broker is an HTTP
+ * client as well as a server, and bjm_serve's loop interleaves the two.
  *
- * Handlers run on the event loop, so nothing here may block.
+ * GET /sub survives as the way to *read* a subject — for browsing, for
+ * one-shot tools, for `bjmsg dead` — but nothing subscribes with it.
+ *
+ * Handlers run on the event loop, so nothing here may block. That is why
+ * registering a subscription only records it: the first delivery happens
+ * on the next pump, not inside the handler.
  */
 #include "bjmsg.h"
 
@@ -37,6 +42,7 @@ typedef struct {
     bjm_store      *store;
     bj_builder     *bld;     /* scratch for composing small responses */
     http11c_server *srv;     /* for connection count in /health */
+    bjm_pusher     *push;    /* the outbound half: delivery to callbacks */
     time_t          started;
 } app;
 
@@ -396,6 +402,173 @@ static void h_ack(http11c_request *req, http11c_response *res) {
     bj_put_string(b, (const uint8_t *)consumer, (uint32_t)strlen(consumer));
     bj_put_key(b, (const uint8_t *)"acked", 5);
     bj_put_int(b, (int64_t)acked);
+    bj_end_object(b);
+
+    size_t out_len = 0;
+    const uint8_t *out = bj_builder_data(b, &out_len);
+    if (!out) { res_err(res, 500, "encode failed\n"); return; }
+    res_bj(res, 200, out, out_len);
+}
+
+/* ---- push subscriptions ------------------------------------------------ */
+
+/* As subject_of, for a path that names a subject *or* a wildcard pattern. */
+static const char *pattern_of(http11c_request *req, http11c_response *res,
+                              const char *prefix) {
+    const char *p = http11c_req_path(req) + strlen(prefix);
+    int ok = bjm_pattern_is(p) ? bjm_pattern_valid(p) : bjm_subject_valid(p);
+    if (!ok) {
+        res_err(res, 400, "invalid subject or pattern: '.'-separated tokens "
+                          "of [A-Za-z0-9_-], '*' for one token, '>' for the "
+                          "rest (last only)\n");
+        return NULL;
+    }
+    return p;
+}
+
+static void h_push_list(http11c_request *req, http11c_response *res) {
+    app *a = http11c_req_ctx(req);
+    const uint8_t *out = NULL;
+    size_t out_len = 0;
+    int e = bjm_pusher_list(a->push, &out, &out_len);
+    if (e) { res_err(res, status_for(e), "listing failed\n"); return; }
+    res_bj(res, 200, out, out_len);
+}
+
+static void h_push_put(http11c_request *req, http11c_response *res) {
+    app *a = http11c_req_ctx(req);
+
+    const char *pattern = pattern_of(req, res, "/push/");
+    if (!pattern) return;
+
+    char consumer[BJM_CONSUMER_MAX + 1];
+    int has_consumer = query_consumer(req, res, consumer, sizeof consumer);
+    if (has_consumer < 0) return;
+    if (!has_consumer) {
+        res_err(res, 400, "?consumer=<name> is required: it is the "
+                          "subscription's identity and where its receipt "
+                          "is kept\n");
+        return;
+    }
+
+    bjm_push_sub cfg;
+    memset(&cfg, 0, sizeof cfg);
+    snprintf(cfg.pattern, sizeof cfg.pattern, "%s", pattern);
+
+    if (http11c_req_query_get(req, "callback", cfg.callback,
+                              sizeof cfg.callback) != 1 ||
+        !bjm_callback_valid(cfg.callback)) {
+        res_err(res, 400, "?callback=<url> is required: an http:// or "
+                          "https:// URL this broker can reach, which is "
+                          "where messages are POSTed\n");
+        return;
+    }
+    /*
+     * Shipped on every delivery as a bearer token, so the subscriber can
+     * tell this broker's POSTs from anybody else's. It is the subscriber
+     * proving the broker, not the other way round — see README on the
+     * asymmetry.
+     */
+    if (http11c_req_query_get(req, "token", cfg.token, sizeof cfg.token) == 1 &&
+        !bjm_token_valid(cfg.token)) {
+        res_err(res, 400, "invalid token: up to 128 printable, space-free "
+                          "bytes\n");
+        return;
+    }
+    cfg.batch_bytes = query_u64(req, "batch", 0);
+
+    /*
+     * A brand-new subscription gets its receipts written now, before the
+     * first delivery, so where it starts is settled once. An existing one
+     * keeps its place: re-registering is how a subscriber that restarted
+     * on a different port says where it moved to, and it must not be a
+     * way to accidentally replay the log.
+     */
+    int found = 0;
+    bjm_push_sub existing;
+    int e = bjm_push_get(a->store, consumer, &found, &existing);
+    if (e) { res_err(res, status_for(e), "lookup failed\n"); return; }
+
+    if (!found) {
+        char start[8];
+        int at_end = http11c_req_query_get(req, "start", start,
+                                           sizeof start) == 1 &&
+                     strcmp(start, "last") == 0;
+        bjm_pusher_seed(a->push, consumer, cfg.pattern, at_end,
+                        query_u64(req, "from", 0));
+    }
+
+    e = bjm_push_set(a->store, consumer, &cfg);
+    if (e) { res_err(res, status_for(e), "subscribe failed\n"); return; }
+    if (bjm_pusher_add(a->push, consumer, &cfg) != 0) {
+        res_err(res, 503, "out of memory\n");
+        return;
+    }
+
+    bj_builder *b = a->bld;
+    bj_builder_reset(b);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"consumer", 8);
+    bj_put_string(b, (const uint8_t *)consumer, (uint32_t)strlen(consumer));
+    bj_put_key(b, (const uint8_t *)"pattern", 7);
+    bj_put_string(b, (const uint8_t *)cfg.pattern,
+                  (uint32_t)strlen(cfg.pattern));
+    bj_put_key(b, (const uint8_t *)"callback", 8);
+    bj_put_string(b, (const uint8_t *)cfg.callback,
+                  (uint32_t)strlen(cfg.callback));
+    /* False means the subscription was already here and kept its place. */
+    bj_put_key(b, (const uint8_t *)"created", 7);
+    bj_put_bool(b, !found);
+    bj_end_object(b);
+
+    size_t out_len = 0;
+    const uint8_t *out = bj_builder_data(b, &out_len);
+    if (!out) { res_err(res, 500, "encode failed\n"); return; }
+    res_bj(res, 200, out, out_len);
+}
+
+static void h_push_delete(http11c_request *req, http11c_response *res) {
+    app *a = http11c_req_ctx(req);
+
+    char consumer[BJM_CONSUMER_MAX + 1];
+    int has_consumer = query_consumer(req, res, consumer, sizeof consumer);
+    if (has_consumer < 0) return;
+    if (!has_consumer) {
+        res_err(res, 400, "?consumer=<name> is required\n");
+        return;
+    }
+
+    int deleted = 0;
+    int e = bjm_push_delete(a->store, consumer, &deleted);
+    if (e) { res_err(res, status_for(e), "delete failed\n"); return; }
+    bjm_pusher_remove(a->push, consumer);
+
+    /*
+     * The receipt normally stays. Unregistering says "stop sending to
+     * that address", which a durable subscriber does every time it shuts
+     * down; forgetting how far it had read as well would replay the whole
+     * log the next time it came back.
+     *
+     * ?purge=1 says this was a throwaway subscription that is not coming
+     * back, and its position should go with it. Something has to: a
+     * receipt holds retention off the messages below it, so a session
+     * that merely stopped would pin the log it read forever.
+     */
+    int purged = 0;
+    if (query_u64(req, "purge", 0)) {
+        e = bjm_cursor_delete_consumer(a->store, consumer, &purged);
+        if (e) { res_err(res, status_for(e), "purge failed\n"); return; }
+    }
+
+    bj_builder *b = a->bld;
+    bj_builder_reset(b);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"consumer", 8);
+    bj_put_string(b, (const uint8_t *)consumer, (uint32_t)strlen(consumer));
+    bj_put_key(b, (const uint8_t *)"deleted", 7);
+    bj_put_bool(b, deleted);
+    bj_put_key(b, (const uint8_t *)"purged", 6);
+    bj_put_int(b, purged);
     bj_end_object(b);
 
     size_t out_len = 0;
@@ -914,6 +1087,9 @@ static void h_not_found(http11c_request *req, http11c_response *res) {
     res_err(res, 404,
         "no such route. available:\n"
         "  POST   /pub/<subject>[?id=][&headers=1][&ack_subject=&ack_consumer=&ack_index=]\n"
+        "  PUT    /push/<subject|pattern>?consumer=&callback=[&token=&batch=&start=last|&from=]\n"
+        "  DELETE /push?consumer=\n"
+        "  GET    /push\n"
         "  GET    /sub/<subject>?from=|consumer=\n"
         "  POST   /ack/<subject>?consumer=&index=\n"
         "  POST   /trim/<subject>?before=|keep=[&force=1]\n"
@@ -935,6 +1111,14 @@ static void h_not_found(http11c_request *req, http11c_response *res) {
 
 static volatile sig_atomic_t g_running = 1;
 
+/* bjm_store_on_publish's hook: the store does not know what a pusher is,
+ * and does not need to. */
+static void on_publish(void *ctx, const char *subject, uint64_t index) {
+    app *a = ctx;
+    (void)index;
+    bjm_pusher_notify(a->push, subject);
+}
+
 static void on_signal(int sig) {
     (void)sig;
     g_running = 0;
@@ -955,8 +1139,24 @@ int bjm_serve(const char *host, int port, const char *dir,
 
     a.started = time(NULL);
 
+    a.push = bjm_pusher_new(a.store, DEFAULT_MAX_BATCH_BYTES);
+    if (!a.push) {
+        fprintf(stderr, "bjmsg: cannot start the delivery engine\n");
+        bj_builder_free(a.bld);
+        bjm_store_free(a.store);
+        return 1;
+    }
+    /* Every append wakes whatever is subscribed to that subject — a
+     * publish, a requeue, a job being dead-lettered, all of them. */
+    bjm_store_on_publish(a.store, on_publish, &a);
+
     http11c_server *s = http11c_server_new();
-    if (!s) { bj_builder_free(a.bld); bjm_store_free(a.store); return 1; }
+    if (!s) {
+        bjm_pusher_free(a.push);
+        bj_builder_free(a.bld);
+        bjm_store_free(a.store);
+        return 1;
+    }
     a.srv = s;
 
     http11c_set_ctx(s, &a);
@@ -964,6 +1164,9 @@ int bjm_serve(const char *host, int port, const char *dir,
     http11c_set_idle_timeout(s, IDLE_TIMEOUT_SECS);
 
     http11c_route(s, "POST", "/pub/*", h_publish);
+    http11c_route(s, "PUT",  "/push/*", h_push_put);
+    http11c_route(s, "DELETE", "/push", h_push_delete);
+    http11c_route(s, "GET",  "/push", h_push_list);
     http11c_route(s, "GET",  "/sub/*", h_subscribe);
     http11c_route(s, "POST", "/ack/*", h_ack);
     http11c_route(s, "POST", "/trim/*", h_trim);
@@ -997,18 +1200,23 @@ int bjm_serve(const char *host, int port, const char *dir,
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
 
-    fprintf(stderr, "bjmsg: serving %s on http://%s:%d (%s)\n",
-            dir, host, http11c_port(s), http11c_backend());
+    fprintf(stderr, "bjmsg: serving %s on http://%s:%d (%s), "
+                    "%d push subscription(s)\n",
+            dir, host, http11c_port(s), http11c_backend(),
+            bjm_pusher_count(a.push));
 
     /*
-     * Our own loop rather than http11c_run, so retention has somewhere to
-     * happen. http11c_poll returns after at most a second, which bounds
-     * how late a sweep can be; the sweep itself is skipped entirely when
-     * no subject has a policy.
+     * Our own loop rather than http11c_run, because the broker has two
+     * jobs: answering requests and making them. bjm_pusher_pump starts
+     * whatever deliveries are due, services those in flight, and answers
+     * how long we may block before it wants attention again — a couple of
+     * milliseconds mid-delivery, a full second when idle. Retention gets
+     * its sweep from the same loop.
      */
     time_t last_sweep = time(NULL);
     while (g_running) {
-        if (http11c_poll(s, 1000) < 0) { rc = 1; break; }
+        int wait = bjm_pusher_pump(a.push, bjm_now_ms());
+        if (http11c_poll(s, wait) < 0) { rc = 1; break; }
 
         time_t now = time(NULL);
         if (now - last_sweep < RETENTION_SWEEP_SECS) continue;
@@ -1028,6 +1236,10 @@ int bjm_serve(const char *host, int port, const char *dir,
 
 done:
     g_srv = NULL;
+    /* Before the store: a delivery still in flight would otherwise report
+     * its receipt into freed memory. */
+    bjm_store_on_publish(a.store, NULL, NULL);
+    bjm_pusher_free(a.push);
     http11c_server_free(s);
     bj_builder_free(a.bld);
     bjm_store_free(a.store);

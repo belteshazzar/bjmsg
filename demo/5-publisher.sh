@@ -35,7 +35,7 @@ case "${1:-}" in
             "Hello NATS!" \
             "...except this one is binjson over HTTP/1.1" \
             "every subscriber gets its own copy" \
-            "and the broker keeps no subscriber state" \
+            "and the broker pushed it to you, you never asked" \
             "goodbye"
         do
             publish "$text"

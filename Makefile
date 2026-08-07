@@ -13,7 +13,7 @@ CPPFLAGS += -DBJIO_REQUIRE_SYNC \
 CURL_CFLAGS := $(shell curl-config --cflags 2>/dev/null)
 CURL_LIBS   := $(shell curl-config --libs 2>/dev/null || echo -lcurl)
 
-SRC := src/main.c src/server.c src/store.c src/client.c src/bjtext.c
+SRC := src/main.c src/server.c src/store.c src/push.c src/client.c src/bjtext.c
 
 # One copy of binjson, shared by our code and by binjson-structures —
 # binjson-structures' own nested third_party/binjson stays uninitialised
